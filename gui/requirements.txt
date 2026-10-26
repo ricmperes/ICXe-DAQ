@@ -1,0 +1,12 @@
+# ICXe DAQ GUI. System Python is 3.9; numpy 1.23 is already installed.
+# Create the venv with access to that numpy, then install:
+#   python3 -m venv --system-site-packages .venv
+#   .venv/bin/pip install -r requirements.txt
+#   .venv/bin/python icxe_gui.py
+#   .venv/bin/python icxe_gui.py --config ../config/default.json
+#
+# PySide6 6.9 and later need Python 3.10. 6.8.3 and pyqtgraph 0.13.7
+# are the wheels verified with this machine's Python 3.9.
+numpy>=1.23,<1.25
+PySide6==6.8.3
+pyqtgraph==0.13.7
