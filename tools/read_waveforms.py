@@ -21,12 +21,20 @@ import argparse
 import json
 import sys
 from typing import Dict, Tuple
-
+import matplotlib.pyplot as plt
 import numpy as np
 
 MAGIC = b"ICX1"
 HEADER_BYTES = 20
 
+
+def plot_waveform(waveform, full_range=False, ylabel='ADC counts'):
+    plt.plot(waveform)
+    plt.xlabel('Samples')
+    plt.ylabel(ylabel)
+    if full_range:
+        plt.ylim(0, 2**14)
+    plt.show()
 
 def enabled_channels(mask: int):
     return [i for i in range(16) if mask & (1 << i)]

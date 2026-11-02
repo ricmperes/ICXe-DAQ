@@ -1,0 +1,30 @@
+{
+  "data": "/data/PMT_on_flex/3inch/",
+  "amp_bounds": [0, 100],
+  "charge_bounds": [-200, 1500],
+  "led_window": [680, 760],      
+  "softfilter": false,
+  "cutoff_mhz": 10,
+  "mu_bounds": [250, 750],
+  "cmap": true,
+  "runs": [
+    {"tag": "130654", "label": "1.5 m microstrip 70MHz filter", 
+    "led_window": [580, 640]},
+    {"tag": "132111", "label": "3 m microstrip 70MHz filter", 
+    "led_window": [580, 640]},
+    {"tag": "132941", "label": "4.5 m microstrip 70MHz filter", 
+    "led_window": [580, 640]},
+    {"tag": "133333", "label": "6 m microstrip 70MHz filter", 
+    "led_window": [590, 650]},
+    {"tag": "134200", "label": "7.5 m microstrip 70MHz filter", 
+    "led_window": [590, 650]},
+    {"tag": "135426", "label": "9 m microstrip 70MHz filter", 
+    "led_window": [600, 660]},
+    {"tag": "140100", "label": "10.5 m microstrip 70MHz filter", 
+    "led_window": [605, 665]},
+    {"tag": "140435", "label": "12 m microstrip 70MHz filter", 
+    "led_window": [610, 670]},
+    {"tag": "142853", "label": "15 m microstrip 70MHz filter", 
+    "led_window": [610, 670]}
+    ]
+}
