@@ -1,0 +1,55 @@
+{
+  "name": "PMT_1_5kV_2vpp_10adccounts",
+  "output_directory": "data",
+  "duration_s": 0,
+  "waveforms_per_file": 50000,
+  "record_length": 1020,
+  "pre_trigger_samples": 500,
+  "n_buffers": null,
+  "dynamic_range": "2Vpp",
+  "max_events_blt": 32,
+  "connection": {
+    "link_type": "optical",
+    "link_num": 0,
+    "conet_node": 0,
+    "vme_base_address": "0x32140000",
+    "use_vme_base_address": false
+  },
+  "baseline": {
+    "apply_on_start": true,
+    "tolerance_lsb": 5,
+    "max_iterations": 12,
+    "triggers_per_step": 8
+  },
+  "channels": [
+    {
+      "index": 0,
+      "enabled": true,
+      "polarity": "negative",
+      "target_percent": 85,
+      "threshold": 10
+    },
+    {
+      "index": 1,
+      "enabled": true,
+      "polarity": "negative",
+      "target_percent": 15,
+      "threshold": 100
+    }
+  ],
+  "trigger": {
+    "type": "coincidence",
+    "io_level": "TTL",
+    "rate_hz": 10,
+    "coincidence": {
+      "majority": 0,
+      "window_ns": 48,
+      "pairs": [
+        {
+          "channels": [0, 1],
+          "logic": "or"
+        }
+      ]
+    }
+  }
+}
