@@ -1,13 +1,16 @@
 #include "self_test.hpp"
 
 #include "buffers.hpp"
+#include "chunks.hpp"
 #include "coincidence.hpp"
 #include "config.hpp"
+#include "util.hpp"
 #include "writer.hpp"
 
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -54,6 +57,118 @@ void replace_once(std::string& text, const std::string& from, const std::string&
         throw std::runtime_error("self-test could not find \"" + from + "\"");
     }
     text.replace(pos, from.size(), to);
+}
+
+void test_utc_stamp() {
+    const std::time_t before = std::time(nullptr);
+    const UtcStamp s = utc_now_stamp();
+    const std::time_t after = std::time(nullptr);
+    const int64_t sec = s.unix_ns / 1000000000LL;
+    CHECK(sec >= static_cast<int64_t>(before) && sec <= static_cast<int64_t>(after));
+    CHECK(s.iso.size() == 20 && s.iso.back() == 'Z');
+    // The ISO string is the whole-second part of the same reading.
+    const std::time_t t = static_cast<std::time_t>(sec);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    CHECK(s.iso == buf);
+}
+
+void test_chunks() {
+    constexpr int64_t s = 1000000000LL;  // ns per second
+    constexpr uint64_t wrap = kTriggerTimeTagWrapTicks;
+    const int64_t acq = 1700000000LL * s;
+
+    // Unwrapping: true tick count -> raw 32-bit tag, read 2 ms later on the PC.
+    {
+        TimeTagUnwrapper u(acq);
+        const uint64_t truth[] = {
+            100,                     // first event, no wrap yet
+            1000,                    // close after
+            wrap - 10,               // just before the first wrap
+            wrap + 5,                // just after it
+            5 * wrap + 777,          // 4 wraps of silence (~69 s, slow trigger)
+            5 * wrap + 900,
+            40 * wrap + 3,           // ~10 min later
+        };
+        for (uint64_t t : truth) {
+            const uint32_t raw = static_cast<uint32_t>(t & 0xffffffffull);  // board keeps 32 bits
+            const int64_t read = acq + static_cast<int64_t>(t) * 8 + 2000000;
+            CHECK(u.unwrap(raw, read) == t);
+        }
+    }
+    // Bit 31 used as a roll-over flag instead of a counter bit: same result.
+    {
+        TimeTagUnwrapper u(acq);
+        const uint64_t t = 3 * wrap + 42;
+        const uint32_t raw = 0x80000000u | 42u;
+        CHECK(u.unwrap(raw, acq + static_cast<int64_t>(t) * 8 + 1000000) == t);
+    }
+    // Events read in one block share one read time.
+    {
+        TimeTagUnwrapper u(acq);
+        const int64_t read = acq + static_cast<int64_t>(wrap + 200) * 8 + 500000;
+        CHECK(u.unwrap(static_cast<uint32_t>(wrap - 100), read) == wrap - 100);
+        CHECK(u.unwrap(100u, read) == wrap + 100);
+        CHECK(u.unwrap(200u, read) == wrap + 200);
+    }
+
+    // Chunks: record 1020 samples (2040 ns), pre-trigger 204 samples (408 ns).
+    const int64_t run_start = acq - 5000000;  // run start 5 ms before acquisition
+    ChunkTracker tr(run_start, acq, 204, 1020);
+    // ticks of 10 events; 4 per file -> files 0, 0, 0, 0, 1, 1, 1, 1, 2, 2
+    const uint64_t ticks[] = {10, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
+    for (int i = 0; i < 10; ++i) {
+        const int file = i / 4;
+        tr.add_event(file, "wf_0000" + std::to_string(file) + ".bin", static_cast<uint32_t>(i),
+                     ticks[i]);
+    }
+    CHECK(tr.chunks().size() == 3);
+    CHECK(!tr.chunks().back().end_ns.has_value());
+    const int64_t stop = acq + 9000LL * 8 + 50000000;
+    const int64_t last_end = tr.close(stop);
+    const auto& c = tr.chunks();
+    CHECK(last_end == stop);
+    CHECK(c[0].n_events == 4 && c[1].n_events == 4 && c[2].n_events == 2);
+    CHECK(c[1].first_event_counter == 4 && c[1].last_event_counter == 7);
+    CHECK(c[2].file == "wf_00002.bin");
+    // First waveform starts 408 ns before its trigger at 80 ns, i.e. before acq.
+    CHECK(c[0].first_waveform_start_ns == acq + 80 - 408);
+    CHECK(c[0].start_ns == c[0].first_waveform_start_ns);
+    CHECK(c[0].start_ns >= run_start);
+    for (std::size_t i = 0; i < c.size(); ++i) {
+        CHECK(c[i].end_ns.has_value());
+        CHECK(c[i].start_ns <= c[i].first_waveform_start_ns);
+        CHECK(c[i].last_waveform_end_ns <= *c[i].end_ns);
+        if (i + 1 < c.size()) {
+            CHECK(*c[i].end_ns == c[i + 1].start_ns);
+        }
+    }
+    // Boundary is the next chunk's first waveform start.
+    CHECK(*c[0].end_ns == tr.waveform_start_ns(4000));
+
+    // Overlapping waveforms at a boundary: the earlier chunk keeps its waveform.
+    {
+        ChunkTracker ov(acq, acq, 204, 1020);
+        ov.add_event(0, "wf_00000.bin", 0, 1000);
+        ov.add_event(1, "wf_00001.bin", 1, 1100);  // 800 ns later, record is 2040 ns
+        CHECK(*ov.chunks()[0].end_ns == ov.waveform_end_ns(1000));
+        CHECK(ov.chunks()[1].start_ns == ov.waveform_end_ns(1000));
+    }
+    // Clock drift: a last waveform after the PC stop time extends the last chunk.
+    {
+        ChunkTracker dr(acq, acq, 0, 1000);
+        dr.add_event(0, "wf_00000.bin", 0, 1000000);
+        const int64_t end = dr.close(acq + 1000);
+        CHECK(end == dr.waveform_end_ns(1000000));
+    }
+    // A trigger right at the start never moves the first chunk before the run start.
+    {
+        ChunkTracker early(acq, acq, 1000, 1020);
+        early.add_event(0, "wf_00000.bin", 0, 0);
+        CHECK(early.chunks()[0].start_ns == acq);
+    }
 }
 
 void test_buffers() {
@@ -227,6 +342,7 @@ void test_writer(const fs::path& dir) {
         for (uint32_t i = 0; i < 3; ++i) {
             ev.event_counter = 1000u + i;
             ev.trigger_time_tag = 50u + i;
+            ev.trigger_time_ticks = (3ull << 31) + 50u + i;
             writer.write_event(ev);
         }
         writer.flush();
@@ -242,6 +358,8 @@ void test_writer(const fs::path& dir) {
     CHECK(second.size() == 1);
     CHECK(first[0].event_counter == 1000);
     CHECK(first[1].trigger_time_tag == 51);
+    CHECK(first[1].trigger_time_ticks == (3ull << 31) + 51u);
+    CHECK(second[0].trigger_time_ticks == (3ull << 31) + 52u);
     CHECK(first[0].channel_mask == 0x5u);
     CHECK(first[0].sample_count == 8);
     CHECK(first[0].samples.size() == 16);
@@ -250,8 +368,37 @@ void test_writer(const fs::path& dir) {
     CHECK(first[0].samples[8] == 2000);
     CHECK(second[0].event_counter == 1002);
     CHECK(second[0].samples[9] == 2001);
-    CHECK(fs::file_size(run / "wf_00000.bin") == 2 * (20 + 16 * 2));
-    CHECK(fs::file_size(run / "wf_00001.bin") == 20 + 16 * 2);
+    CHECK(fs::file_size(run / "wf_00000.bin") == 2 * (28 + 16 * 2));
+    CHECK(fs::file_size(run / "wf_00001.bin") == 28 + 16 * 2);
+    {
+        std::ifstream in(run / "wf_00000.bin", std::ios::binary);
+        char magic[4] = {};
+        in.read(magic, 4);
+        CHECK(std::string(magic, 4) == "ICX2");
+    }
+
+    // An ICX1 event (20-byte header, no tick field) is still read.
+    {
+        std::string v1 = "ICX1";
+        const uint32_t fields[] = {7u, 1234u, 0x1u, 2u};
+        for (uint32_t f : fields) {
+            for (int b = 0; b < 4; ++b) {
+                v1.push_back(static_cast<char>((f >> (8 * b)) & 0xffu));
+            }
+        }
+        v1 += std::string("\x05\x00\x06\x00", 4);
+        const fs::path v1_path = run / "v1.bin";
+        {
+            std::ofstream out(v1_path, std::ios::binary);
+            out.write(v1.data(), static_cast<std::streamsize>(v1.size()));
+        }
+        const auto old = read_waveform_file(v1_path);
+        CHECK(old.size() == 1);
+        CHECK(old[0].event_counter == 7);
+        CHECK(old[0].trigger_time_tag == 1234);
+        CHECK(old[0].trigger_time_ticks == 1234);
+        CHECK(old[0].samples.size() == 2 && old[0].samples[1] == 6);
+    }
 
     const std::string frame = encode_scope_frame(ev.samples.data(), 4);
     CHECK(frame.size() == 8 + 8);
@@ -276,7 +423,9 @@ int run_self_test(const std::string& config_path) {
     const fs::path dir = fs::path(config_path).parent_path().parent_path() / "build" / "selftest-data";
     fs::create_directories(dir);
     try {
+        test_utc_stamp();
         test_buffers();
+        test_chunks();
         test_coincidence();
         test_config(config_path, dir);
         test_writer(dir);

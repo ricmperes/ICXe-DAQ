@@ -13,6 +13,7 @@ add_executable(icxe-daq
   src/main.cpp
   src/config.cpp
   src/buffers.cpp
+  src/chunks.cpp
   src/coincidence.cpp
   src/writer.cpp
   src/digitizer.cpp
