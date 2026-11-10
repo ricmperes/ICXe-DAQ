@@ -679,7 +679,7 @@ public:
         const fs::path run_dir = make_run_dir();
         fs::copy_file(config_path, run_dir / "config.json", fs::copy_options::overwrite_existing);
         WaveformWriter writer(run_dir, cfg_.waveforms_per_file);
-        const std::string started = utc_now_iso();
+        const UtcStamp started = utc_now_stamp();
         std::string stop = "error";
         json meta = make_metadata(started);
         write_metadata(run_dir / "metadata.json", meta);
@@ -762,7 +762,9 @@ public:
             writer.flush();
             meta["events_written"] = writer.events_written();
             meta["files"] = writer.filenames();
-            meta["ended_utc"] = utc_now_iso();
+            const UtcStamp ended = utc_now_stamp();
+            meta["ended_utc"] = ended.iso;
+            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
             meta["stop_reason"] = "error";
             write_metadata(run_dir / "metadata.json", meta);
             throw;
@@ -775,7 +777,9 @@ public:
         writer.flush();
         meta["events_written"] = writer.events_written();
         meta["files"] = writer.filenames();
-        meta["ended_utc"] = utc_now_iso();
+        const UtcStamp ended = utc_now_stamp();
+        meta["ended_utc"] = ended.iso;
+        meta["ended_utc_unix_time_ns"] = ended.unix_ns;
         meta["stop_reason"] = stop;
         write_metadata(run_dir / "metadata.json", meta);
         std::fprintf(stdout, "events=%llu file=%d stop=%s\n",
@@ -1304,7 +1308,7 @@ private:
         return dir;
     }
 
-    json make_metadata(const std::string& started) const {
+    json make_metadata(const UtcStamp& started) const {
         json meta;
         meta["board"] = {
             {"model", board_.model_name},
@@ -1413,8 +1417,10 @@ private:
             channels.push_back(cj);
         }
         meta["channels"] = channels;
-        meta["started_utc"] = started;
+        meta["started_utc"] = started.iso;
+        meta["started_utc_unix_time_ns"] = started.unix_ns;
         meta["ended_utc"] = nullptr;
+        meta["ended_utc_unix_time_ns"] = nullptr;
         meta["events_written"] = 0;
         meta["files"] = json::array();
         meta["stop_reason"] = nullptr;

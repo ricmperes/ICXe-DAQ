@@ -3,11 +3,13 @@
 #include "buffers.hpp"
 #include "coincidence.hpp"
 #include "config.hpp"
+#include "util.hpp"
 #include "writer.hpp"
 
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -54,6 +56,22 @@ void replace_once(std::string& text, const std::string& from, const std::string&
         throw std::runtime_error("self-test could not find \"" + from + "\"");
     }
     text.replace(pos, from.size(), to);
+}
+
+void test_utc_stamp() {
+    const std::time_t before = std::time(nullptr);
+    const UtcStamp s = utc_now_stamp();
+    const std::time_t after = std::time(nullptr);
+    const int64_t sec = s.unix_ns / 1000000000LL;
+    CHECK(sec >= static_cast<int64_t>(before) && sec <= static_cast<int64_t>(after));
+    CHECK(s.iso.size() == 20 && s.iso.back() == 'Z');
+    // The ISO string is the whole-second part of the same reading.
+    const std::time_t t = static_cast<std::time_t>(sec);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    CHECK(s.iso == buf);
 }
 
 void test_buffers() {
@@ -276,6 +294,7 @@ int run_self_test(const std::string& config_path) {
     const fs::path dir = fs::path(config_path).parent_path().parent_path() / "build" / "selftest-data";
     fs::create_directories(dir);
     try {
+        test_utc_stamp();
         test_buffers();
         test_coincidence();
         test_config(config_path, dir);

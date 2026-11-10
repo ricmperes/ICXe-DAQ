@@ -71,6 +71,19 @@ The event header already carries the mask and the sample count. These metadata f
 
 `channel_mask` in JSON is a string from `hex32` (`"0x7"`). The header stores the same mask as a binary `uint32`. `record_length_requested` is the config request; the length on disk is `record_length` and the header sample count. `pre_trigger_samples_actual` and `post_trigger_samples_actual` (204 and 816 in the example) locate the trigger inside the full record. Per-channel DAC and baseline fields describe the setup and are separate from the sample packing.
 
+## Run timestamps
+
+| Field | Example | Role |
+| --- | --- | --- |
+| `started_utc` | `"2026-11-02T13:21:08Z"` | Run start, UTC, whole seconds. |
+| `started_utc_unix_time_ns` | `1793625668123456789` | Same instant as `started_utc`, Unix time in nanoseconds (integer). |
+| `ended_utc` | `"2026-11-02T13:25:41Z"` | Run end, UTC, whole seconds. `null` while the run is in progress. |
+| `ended_utc_unix_time_ns` | `1793625941987654321` | Same instant as `ended_utc`, Unix time in nanoseconds. `null` while the run is in progress. |
+
+Each string and its `_unix_time_ns` partner come from one `std::chrono::system_clock` reading, so the string is that value truncated to the second. The start is taken when the run directory is created, a few milliseconds before `CAEN_DGTZ_SWStartAcquisition`. The end is taken after acquisition stops and the last waveform file is flushed.
+
+The clock is the PC wall clock, so its accuracy is that of the host time sync (NTP, typically about a millisecond), not nanoseconds. The trigger time tag counts from the board's own acquisition start, which is offset from `started_utc_unix_time_ns` by an unknown few milliseconds. `started_utc_unix_time_ns + trigger_time_tag * 8` is therefore an approximate absolute event time.
+
 ## Read a file
 
 ```bash

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <sstream>
@@ -21,6 +22,25 @@ inline std::string utc_now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;
+}
+
+// One wall-clock reading as both an ISO string (whole seconds) and Unix time in ns.
+struct UtcStamp {
+    std::string iso;
+    int64_t unix_ns = 0;
+};
+
+inline UtcStamp utc_now_stamp() {
+    const auto now = std::chrono::system_clock::now();
+    const int64_t ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    // Floor to whole seconds (ns is positive after 1970, so division floors).
+    const std::time_t t = static_cast<std::time_t>(ns / 1000000000LL);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return UtcStamp{buf, ns};
 }
 
 inline std::string utc_now_compact() {
