@@ -159,20 +159,21 @@ data/<name>_<UTC>/
   wf_00001.bin
 ```
 
-`config.json` is a copy of the JSON that was loaded. `metadata.json` holds board info, firmware, link, `Nb`, the real record length, requested and actual pre/post samples, and per-channel DAC, baseline mean, RMS, and polarity. The trigger time tag is stored raw. `trigger_time_tag_tick_ns` is 8 (125 MHz). The sample period is 2 ns (500 MS/s).
+`config.json` is a copy of the JSON that was loaded. `metadata.json` holds board info, firmware, link, `Nb`, the real record length, requested and actual pre/post samples, per-channel DAC, baseline mean, RMS, and polarity, run start/end times, and a `chunks` list with the time span of each `wf_*.bin` (see [docs/data_format.md](docs/data_format.md)). The trigger time tag is stored raw and also unwrapped into a 64-bit tick count. `trigger_time_tag_tick_ns` is 8 (125 MHz). The sample period is 2 ns (500 MS/s).
 
 Events are concatenated with no extra file header. Each event is little-endian:
 
 | Bytes | Field |
 | --- | --- |
-| 4 | magic `ICX1` |
+| 4 | magic `ICX2` |
 | 4 | `uint32` event counter (digitizer header) |
 | 4 | `uint32` trigger time tag, raw |
 | 4 | `uint32` channel mask |
 | 4 | `uint32` sample count |
+| 8 | `uint64` trigger time ticks, unwrapped (8 ns since acquisition start) |
 | `2 * Nch * Ns` | `int16` ADC codes |
 
-That is a 20-byte header, then samples. Only enabled channels are stored, in ascending channel number. 14-bit codes sit in 16-bit words. Disabled channels are omitted. A 1020-sample, 16-channel event is about 32 KB plus the header.
+That is a 28-byte header, then samples. Runs written before this format use `ICX1`, the same header without the 8-byte tick field (20 bytes). Only enabled channels are stored, in ascending channel number. 14-bit codes sit in 16-bit words. Disabled channels are omitted. A 1020-sample, 16-channel event is about 32 KB plus the header.
 
 ```bash
 python3 tools/read_waveforms.py data/v1730sb_<UTC>/wf_00000.bin \

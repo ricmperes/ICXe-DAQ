@@ -30,10 +30,14 @@ struct UtcStamp {
     int64_t unix_ns = 0;
 };
 
-inline UtcStamp utc_now_stamp() {
-    const auto now = std::chrono::system_clock::now();
-    const int64_t ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+inline int64_t unix_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// ISO string (whole seconds, truncated) for a Unix time in ns.
+inline UtcStamp utc_stamp_from_ns(int64_t ns) {
     // Floor to whole seconds (ns is positive after 1970, so division floors).
     const std::time_t t = static_cast<std::time_t>(ns / 1000000000LL);
     std::tm tm{};
@@ -41,6 +45,10 @@ inline UtcStamp utc_now_stamp() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return UtcStamp{buf, ns};
+}
+
+inline UtcStamp utc_now_stamp() {
+    return utc_stamp_from_ns(unix_now_ns());
 }
 
 inline std::string utc_now_compact() {
@@ -103,11 +111,21 @@ inline void append_u16_le(std::string& out, uint16_t v) {
     out.append(b, 2);
 }
 
+inline void append_u64_le(std::string& out, uint64_t v) {
+    append_u32_le(out, static_cast<uint32_t>(v & 0xffffffffu));
+    append_u32_le(out, static_cast<uint32_t>(v >> 32));
+}
+
 inline uint32_t read_u32_le(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) |
            (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) |
            (static_cast<uint32_t>(p[3]) << 24);
+}
+
+inline uint64_t read_u64_le(const uint8_t* p) {
+    return static_cast<uint64_t>(read_u32_le(p)) |
+           (static_cast<uint64_t>(read_u32_le(p + 4)) << 32);
 }
 
 inline uint16_t read_u16_le(const uint8_t* p) {
@@ -119,7 +137,15 @@ inline constexpr uint32_t kTriggerTimeTagTickNs = 8;
 // 500 MS/s.
 inline constexpr uint32_t kSamplePeriodNs = 2;
 
-inline constexpr char kWaveMagic[4] = {'I', 'C', 'X', '1'};
+// The trigger time tag is unwrapped modulo 2^31 (bit 31 is ignored), so the
+// result is the same whether bit 31 is the counter MSB or a roll-over flag.
+inline constexpr uint64_t kTriggerTimeTagWrapTicks = 1ull << 31;
+
+// ICX2: ICX1 header plus a uint64 unwrapped trigger time (8 ns ticks since
+// the run's acquisition start). ICX1 files are still read.
+inline constexpr char kWaveMagic[4] = {'I', 'C', 'X', '2'};
+inline constexpr char kWaveMagicV1[4] = {'I', 'C', 'X', '1'};
 inline constexpr char kScopeMagic[4] = {'S', 'C', 'P', '1'};
-inline constexpr uint32_t kWaveHeaderBytes = 20;
+inline constexpr uint32_t kWaveHeaderBytes = 28;
+inline constexpr uint32_t kWaveHeaderBytesV1 = 20;
 inline constexpr uint32_t kScopeHeaderBytes = 8;

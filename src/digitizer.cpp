@@ -1,5 +1,6 @@
 #include "digitizer.hpp"
 
+#include "chunks.hpp"
 #include "util.hpp"
 #include "writer.hpp"
 
@@ -7,6 +8,7 @@
 
 #include <CAENDigitizer.h>
 
+#include <algorithm>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -205,6 +207,26 @@ struct Accum {
         n = 0;
     }
 };
+
+json chunks_json(const ChunkTracker& tracker) {
+    json out = json::array();
+    for (const ChunkInfo& c : tracker.chunks()) {
+        json cj = {{"index", c.index},
+                   {"file", c.file},
+                   {"n_events", c.n_events},
+                   {"first_event_counter", c.first_event_counter},
+                   {"last_event_counter", c.last_event_counter},
+                   {"start_unix_time_ns", c.start_ns},
+                   {"end_unix_time_ns", nullptr},
+                   {"first_waveform_start_unix_time_ns", c.first_waveform_start_ns},
+                   {"last_waveform_end_unix_time_ns", c.last_waveform_end_ns}};
+        if (c.end_ns) {
+            cj["end_unix_time_ns"] = *c.end_ns;
+        }
+        out.push_back(cj);
+    }
+    return out;
+}
 
 class ReadoutBuffer {
 public:
@@ -694,6 +716,16 @@ public:
         timespec last_status = start;
         int last_file = 0;
         start_sw("run");
+        // The trigger time tag counts from this start. acq_start_ns_ is taken
+        // just before SWStartAcquisition, after started.
+        TimeTagUnwrapper unwrapper(acq_start_ns_);
+        ChunkTracker chunks(started.unix_ns, acq_start_ns_, pre_actual_, record_read_);
+        meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
+        const auto update_files = [&] {
+            meta["events_written"] = writer.events_written();
+            meta["files"] = writer.filenames();
+            meta["chunks"] = chunks_json(chunks);
+        };
 
         timespec next_trigger = start;
         const bool rate = cfg_.trigger == TriggerType::Rate;
@@ -720,13 +752,18 @@ public:
                     if (max_events > 0 && writer.events_written() >= max_events) {
                         return false;
                     }
+                    // PC time after ReadData returned: the event happened before it.
+                    const int64_t read_ns = unix_now_ns();
                     WaveformEvent event;
                     event.event_counter = info.EventCounter;
                     event.trigger_time_tag = info.TriggerTimeTag;
+                    event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
                     event.channel_mask = cfg_.channel_mask;
                     event.sample_count = record_read_;
                     event.samples = extract_enabled(ev, record_read_);
                     writer.write_event(event);
+                    chunks.add_event(writer.file_index(), writer.filenames().back(),
+                                     event.event_counter, event.trigger_time_ticks);
                     return !(max_events > 0 && writer.events_written() >= max_events);
                 });
                 if (max_events > 0 && writer.events_written() >= max_events) {
@@ -736,8 +773,7 @@ public:
                 const bool file_changed = writer.file_index() != last_file;
                 if (file_changed || elapsed_s(mono_now(), last_status) >= 1.0) {
                     writer.flush();
-                    meta["events_written"] = writer.events_written();
-                    meta["files"] = writer.filenames();
+                    update_files();
                     write_metadata(run_dir / "metadata.json", meta);
                     std::fprintf(stdout, "events=%llu file=%d\n",
                                  static_cast<unsigned long long>(writer.events_written()),
@@ -760,9 +796,11 @@ public:
             }
         } catch (...) {
             writer.flush();
-            meta["events_written"] = writer.events_written();
-            meta["files"] = writer.filenames();
-            const UtcStamp ended = utc_now_stamp();
+            // The last chunk ends no earlier than its last waveform, and the run
+            // ends no earlier than the last chunk.
+            const int64_t chunk_end = chunks.close(unix_now_ns());
+            update_files();
+            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
             meta["ended_utc"] = ended.iso;
             meta["ended_utc_unix_time_ns"] = ended.unix_ns;
             meta["stop_reason"] = "error";
@@ -775,9 +813,9 @@ public:
             acq_on_ = false;
         }
         writer.flush();
-        meta["events_written"] = writer.events_written();
-        meta["files"] = writer.filenames();
-        const UtcStamp ended = utc_now_stamp();
+        const int64_t chunk_end = chunks.close(unix_now_ns());
+        update_files();
+        const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
         meta["ended_utc"] = ended.iso;
         meta["ended_utc_unix_time_ns"] = ended.unix_ns;
         meta["stop_reason"] = stop;
@@ -906,6 +944,9 @@ private:
                                      ": acquisition control 0x8100 is not SW_CONTROLLED (" +
                                      hex32(control) + ")");
         }
+        // The board resets the trigger time tag when acquisition starts. This
+        // PC time is taken before, so it is a lower bound for that reset.
+        acq_start_ns_ = unix_now_ns();
         const CAEN_DGTZ_ErrorCode err = CAEN_DGTZ_SWStartAcquisition(handle_);
         if (err != CAEN_DGTZ_Success) {
             uint32_t status = 0;
@@ -1350,6 +1391,12 @@ private:
         meta["pre_trigger_samples_actual"] = pre_actual_;
         meta["post_trigger_samples_actual"] = post_actual_;
         meta["trigger_time_tag_tick_ns"] = kTriggerTimeTagTickNs;
+        meta["trigger_time_tag_wrap_ticks"] = kTriggerTimeTagWrapTicks;
+        meta["waveform_format"] = std::string(kWaveMagic, 4);
+        meta["trigger_time_ticks_note"] =
+            "trigger_time_ticks in each event header is the unwrapped trigger time tag in 8 ns ticks "
+            "since acquisition start. Unix ns = acquisition_start_unix_time_ns + ticks * 8 "
+            "(PC-clock accuracy, about a millisecond).";
         meta["sample_period_ns"] = kSamplePeriodNs;
         meta["event_counter_note"] =
             "event_counter is the digitizer header counter. Baseline software triggers can advance it before the run.";
@@ -1421,8 +1468,10 @@ private:
         meta["started_utc_unix_time_ns"] = started.unix_ns;
         meta["ended_utc"] = nullptr;
         meta["ended_utc_unix_time_ns"] = nullptr;
+        meta["acquisition_start_unix_time_ns"] = nullptr;
         meta["events_written"] = 0;
         meta["files"] = json::array();
+        meta["chunks"] = json::array();
         meta["stop_reason"] = nullptr;
         meta["waveforms_per_file"] = cfg_.waveforms_per_file;
         return meta;
@@ -1460,6 +1509,7 @@ private:
     const Config& cfg_;
     int handle_ = -1;
     bool acq_on_ = false;
+    int64_t acq_start_ns_ = 0;
     BoardReport board_;
     uint32_t record_read_ = 0;
     uint32_t post_percent_read_ = 0;
