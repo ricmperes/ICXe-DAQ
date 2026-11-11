@@ -319,6 +319,97 @@ void test_config(const std::string& config_path, const fs::path& dir) {
     const Config based = load_config(base_path.string());
     CHECK(based.connection.use_vme_base_address);
     CHECK(open_base_address(based.connection) == 0x32140000u);
+
+    CHECK(!cfg.trigger_requests.configured);
+    CHECK(!cfg.analog_monitor.configured);
+    CHECK(cfg.register_writes.empty());
+}
+
+// Config with extra top-level keys inserted before "trigger".
+Config load_with(const std::string& base_text, const fs::path& path, const std::string& extra) {
+    std::string text = base_text;
+    replace_once(text, "\"trigger\": {", extra + ",\n  \"trigger\": {");
+    {
+        std::ofstream out(path);
+        out << text;
+    }
+    return load_config(path.string());
+}
+
+// Fixed fixture, independent of the lab's config/default.json: channels 0-2
+// enabled with thresholds, external trigger.
+const char* kBenchFixture = R"({
+  "name": "bench",
+  "record_length": 1020,
+  "pre_trigger_samples": 200,
+  "connection": {"link_type": "optical", "link_num": 0, "conet_node": 0,
+                 "vme_base_address": "0x32140000", "use_vme_base_address": false},
+  "channels": [
+    {"index": 0, "polarity": "negative", "target_percent": 85, "threshold": 30},
+    {"index": 1, "polarity": "negative", "target_percent": 85, "threshold": 30},
+    {"index": 2, "polarity": "negative", "target_percent": 85, "threshold": 30}
+  ],
+  "trigger": {"type": "external", "io_level": "NIM"}
+})";
+
+void test_bench_keys(const fs::path& dir) {
+    const std::string text = kBenchFixture;
+    const fs::path path = dir / "bench_keys.json";
+
+    const Config tr = load_with(text, path, "\"trigger_requests\": {\"width_ns\": 1000}");
+    CHECK(tr.trigger_requests.configured);
+    CHECK(tr.trigger_requests.width_ns == 1000u);
+    CHECK(tr.trigger_requests.width_steps == 125u);
+    CHECK(tr.trigger_requests.channel_mask == 0x7u);
+    CHECK(!tr.trigger_requests.trg_out);
+
+    const Config one = load_with(
+        text, path, "\"trigger_requests\": {\"channels\": [1], \"trg_out\": true}");
+    CHECK(one.trigger_requests.channel_mask == 0x2u);
+    CHECK(one.trigger_requests.width_steps == 0u);
+    CHECK(one.trigger_requests.trg_out);
+
+    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"width_ns\": 1001}"); },
+                      "multiple of 8"));
+    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"channels\": [5]}"); },
+                      "enabled channels"));
+
+    const Config maj = load_with(text, path, "\"analog_monitor\": {\"mode\": \"majority\"}");
+    CHECK(maj.analog_monitor.configured);
+    CHECK(maj.analog_monitor.mode == MonitorMode::Majority);
+    CHECK(monitor_mode_bits(MonitorMode::Majority) == 0u);
+    CHECK(monitor_mode_bits(MonitorMode::Test) == 1u);
+    CHECK(monitor_mode_bits(MonitorMode::BufferOccupancy) == 3u);
+    CHECK(monitor_mode_bits(MonitorMode::VoltageLevel) == 4u);
+
+    const Config lvl = load_with(
+        text, path, "\"analog_monitor\": {\"mode\": \"voltage_level\", \"level_volts\": 0.25}");
+    CHECK(lvl.analog_monitor.level_code == 1024u);
+    CHECK(throws_with(
+        [&] {
+            load_with(text, path,
+                      "\"analog_monitor\": {\"mode\": \"voltage_level\", \"level_volts\": 2.0}");
+        },
+        "level_volts"));
+    CHECK(throws_with(
+        [&] { load_with(text, path, "\"analog_monitor\": {\"mode\": \"sawtooth\"}"); },
+        "analog_monitor.mode"));
+
+    const Config raw = load_with(
+        text, path,
+        "\"register_writes\": [{\"address\": \"0x1070\", \"value\": 125},"
+        " {\"address\": 4228, \"value\": \"0x4\", \"mask\": \"0x4\"}]");
+    CHECK(raw.register_writes.size() == 2);
+    CHECK(raw.register_writes[0].address == 0x1070u);
+    CHECK(raw.register_writes[0].value == 125u);
+    CHECK(raw.register_writes[0].mask == 0xffffffffu);
+    CHECK(raw.register_writes[1].address == 0x1084u);
+    CHECK(raw.register_writes[1].mask == 0x4u);
+    CHECK(throws_with(
+        [&] {
+            load_with(text, path, "\"register_writes\": [{\"address\": \"0x1071\", \"value\": 1}]");
+        },
+        "multiple of 4"));
 }
 
 void test_writer(const fs::path& dir) {
@@ -428,6 +519,7 @@ int run_self_test(const std::string& config_path) {
         test_chunks();
         test_coincidence();
         test_config(config_path, dir);
+        test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {
         std::fprintf(stderr, "FAIL exception: %s\n", ex.what());

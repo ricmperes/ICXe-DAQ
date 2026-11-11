@@ -28,7 +28,10 @@ The self-test checks buffer-organization choice, JSON loading, and a waveform-fi
 ./build/icxe-daq run   --config config/default.json
 ./build/icxe-daq run   --config config/default.json --max-events 100
 ./build/icxe-daq scope --config config/default.json --channel 0
+./build/icxe-daq reg   --config config/default.json --address 0x1070 [--value 0x7D]
 ```
+
+`reg` reads one register, or writes it and reads it back, without resetting or programming the board. It is meant for bench tests such as the MON/Σ majority test in [docs/mon_test.md](docs/mon_test.md), which also uses the optional `trigger_requests`, `analog_monitor` and `register_writes` config keys ([docs/config.md](docs/config.md)).
 
 `info` prints board identity (model, serial, channel count, ADC bits, ROC/AMC firmware, DPP vs standard waveform, and the link used to open) and exits. If the optical link is down the open fails with `CAEN_DGTZ_DigitizerNotFound` (or a communication error) and points at the link-check script.
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -16,6 +17,7 @@ void usage(std::ostream& out) {
            "  icxe-daq info  --config <file>\n"
            "  icxe-daq run   --config <file> [--max-events N]\n"
            "  icxe-daq scope --config <file> --channel N\n"
+           "  icxe-daq reg   --config <file> --address 0xADDR [--value 0xVALUE]\n"
            "  icxe-daq --self-test [--config <file>]\n";
 }
 
@@ -46,7 +48,10 @@ int main(int argc, char** argv) {
         const bool info = cmd == "info";
         const bool run = cmd == "run";
         const bool scope = cmd == "scope";
-        if (!self_test && !info && !run && !scope) {
+        const bool reg = cmd == "reg";
+        std::optional<uint32_t> reg_address;
+        std::optional<uint32_t> reg_value;
+        if (!self_test && !info && !run && !scope && !reg) {
             usage(std::cerr);
             return 2;
         }
@@ -88,6 +93,22 @@ int main(int argc, char** argv) {
                 }
                 channel = n;
                 channel_set = true;
+            } else if (is_flag(arg, "--address") || is_flag(arg, "--value")) {
+                if (!reg) {
+                    throw std::runtime_error(arg + " is only valid for reg");
+                }
+                if (i + 1 >= argc) {
+                    throw std::runtime_error(arg + " needs a number");
+                }
+                const uint32_t v = parse_u32_auto(argv[++i], arg.c_str());
+                if (arg == "--address") {
+                    if (v % 4u != 0u || v > 0xfffcu) {
+                        throw std::runtime_error("--address must be a multiple of 4 in 0x0000..0xFFFC");
+                    }
+                    reg_address = v;
+                } else {
+                    reg_value = v;
+                }
             } else if (is_flag(arg, "--help") || arg == "-h") {
                 usage(std::cout);
                 return 0;
@@ -118,6 +139,13 @@ int main(int argc, char** argv) {
         }
         if (run) {
             command_run(cfg, config, max_events_set ? max_events : 0);
+            return 0;
+        }
+        if (reg) {
+            if (!reg_address) {
+                throw std::runtime_error("reg requires --address 0xADDR");
+            }
+            command_reg(cfg, *reg_address, reg_value);
             return 0;
         }
         if (!channel_set) {

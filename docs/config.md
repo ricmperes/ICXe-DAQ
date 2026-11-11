@@ -96,6 +96,25 @@ SRAM is 5.12 MS/channel, split into `Nb` equal buffers. The longest record in a 
 | `trigger.coincidence.pairs[].channels` | array of integers | `[0, 1]` | one or two channels of one couple `2i, 2i+1` | Channels that form that pair request. |
 | `trigger.coincidence.pairs[].logic` | string | `and` | `and`, `or`, `even`, `odd` | `and` and `or` list both channels; `even` lists only the even channel; `odd` lists only the odd channel. |
 
+## Trigger requests, analog monitor, raw registers
+
+All three are optional and absent from `config/default.json`. `config/mon_test.json` uses the first two; the bench procedure is [mon_test.md](mon_test.md). They are applied after the trigger is armed, in this order, and every register is read back. Values go to stderr and `metadata.json`.
+
+| Path | Type | Default | Allowed | What it does |
+| --- | --- | --- | --- | --- |
+| `trigger_requests` | object or null | absent | object | Programs thresholds (baseline ± `channels[].threshold`) and the self-trigger pulse width on the listed channels, also when `trigger.type` is `external` or `rate`. The requests then do not start the acquisition, but MON/Σ majority and (with `trg_out`) TRG-OUT see them. With `coincidence`, the pair channels also get the width. |
+| `trigger_requests.width_ns` | integer | `0` (register left at reset value, 16 ns per UM2792) | multiple of 8 | Writes 0x1n70 = `width_ns / 8`. A readback that differs is a stderr WARNING; the board's field width is not documented for this firmware. |
+| `trigger_requests.channels` | array of integers | every enabled channel | enabled channels with `threshold >= 1` | Channels that get threshold and width. |
+| `trigger_requests.trg_out` | boolean | `false` | `true` or `false` | Also routes the requests to TRG-OUT (`EXTOUT_ONLY`; with `coincidence`, `ACQ_AND_EXTOUT`). |
+| `analog_monitor.mode` | string | required in the object | `majority`, `test`, `buffer_occupancy`, `voltage_level` | MON/Σ mode, 0x8144 bits[2:0] = 0, 1, 3, 4. `majority` is proportional to the number of channels over threshold. |
+| `analog_monitor.level_volts` | number | required for `voltage_level` only | `0 .. 4095/4096` | DC level on MON, 0x8138 = round(V × 4096). |
+| `register_writes` | array or null | absent | objects below | Raw writes for bench tests, in order, after everything else. |
+| `register_writes[].address` | integer or `"0x..."` | required | multiple of 4, `0x0000..0xFFFC` | Register address. |
+| `register_writes[].value` | integer or `"0x..."` | required | 32-bit | Value to write. |
+| `register_writes[].mask` | integer or `"0x..."` | `0xFFFFFFFF` | non-zero | Only these bits change: `new = (old & ~mask) | (value & mask)`. |
+
+`icxe-daq reg --config <file> --address 0xADDR [--value 0xVALUE]` reads one register, or writes it and reads it back, without resetting or programming the board.
+
 ## Baseline
 
 `baseline` may be omitted. The code defaults match default.json.
