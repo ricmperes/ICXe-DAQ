@@ -35,6 +35,34 @@ const char* to_string(IoLevel level) {
     return level == IoLevel::Ttl ? "TTL" : "NIM";
 }
 
+const char* to_string(MonitorMode mode) {
+    switch (mode) {
+        case MonitorMode::Majority:
+            return "majority";
+        case MonitorMode::Test:
+            return "test";
+        case MonitorMode::BufferOccupancy:
+            return "buffer_occupancy";
+        case MonitorMode::VoltageLevel:
+            return "voltage_level";
+    }
+    return "majority";
+}
+
+uint32_t monitor_mode_bits(MonitorMode mode) {
+    switch (mode) {
+        case MonitorMode::Majority:
+            return 0u;
+        case MonitorMode::Test:
+            return 1u;
+        case MonitorMode::BufferOccupancy:
+            return 3u;
+        case MonitorMode::VoltageLevel:
+            return 4u;
+    }
+    return 0u;
+}
+
 bool link_type_known(const std::string& link_type) {
     return link_type == "optical" || link_type == "eth_v4718" || link_type == "usb_v4718";
 }
@@ -60,6 +88,24 @@ double target_baseline_adc(double target_percent) {
         throw std::runtime_error("target_percent must be between 0 and 100");
     }
     return target_percent / 100.0 * 16383.0;
+}
+
+uint32_t parse_u32_auto(const std::string& text, const char* what) {
+    if (text.empty()) {
+        throw std::runtime_error(std::string(what) + " is empty");
+    }
+    try {
+        std::size_t idx = 0;
+        unsigned long v = std::stoul(text, &idx, 0);
+        if (idx != text.size() || v > 0xfffffffful) {
+            throw std::runtime_error(std::string("bad ") + what + " \"" + text + "\"");
+        }
+        return static_cast<uint32_t>(v);
+    } catch (const std::runtime_error&) {
+        throw;
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("bad ") + what + " \"" + text + "\"");
+    }
 }
 
 namespace {
@@ -114,24 +160,6 @@ std::string require_string(const json& j, const char* key) {
         throw std::runtime_error(std::string("missing string \"") + key + "\"");
     }
     return j.at(key).get<std::string>();
-}
-
-uint32_t parse_u32_auto(const std::string& text, const char* what) {
-    if (text.empty()) {
-        throw std::runtime_error(std::string(what) + " is empty");
-    }
-    try {
-        std::size_t idx = 0;
-        unsigned long v = std::stoul(text, &idx, 0);
-        if (idx != text.size() || v > 0xfffffffful) {
-            throw std::runtime_error(std::string("bad ") + what + " \"" + text + "\"");
-        }
-        return static_cast<uint32_t>(v);
-    } catch (const std::runtime_error&) {
-        throw;
-    } catch (const std::exception&) {
-        throw std::runtime_error(std::string("bad ") + what + " \"" + text + "\"");
-    }
 }
 
 Polarity parse_polarity(const std::string& s) {
@@ -196,6 +224,143 @@ PairLogic parse_logic(const std::string& s) {
         return PairLogic::Odd;
     }
     throw std::runtime_error("pair logic must be \"and\", \"or\", \"even\", or \"odd\"");
+}
+
+MonitorMode parse_monitor_mode(const std::string& s) {
+    const std::string v = lower_copy(s);
+    if (v == "majority") {
+        return MonitorMode::Majority;
+    }
+    if (v == "test") {
+        return MonitorMode::Test;
+    }
+    if (v == "buffer_occupancy") {
+        return MonitorMode::BufferOccupancy;
+    }
+    if (v == "voltage_level") {
+        return MonitorMode::VoltageLevel;
+    }
+    throw std::runtime_error(
+        "analog_monitor.mode must be \"majority\", \"test\", \"buffer_occupancy\", or "
+        "\"voltage_level\"");
+}
+
+// Register values may be JSON integers or "0x..." strings.
+uint32_t parse_u32_field(const json& j, const char* key, const char* what) {
+    if (!j.contains(key)) {
+        throw std::runtime_error(std::string("missing \"") + key + "\" in " + what);
+    }
+    const json& v = j.at(key);
+    if (v.is_string()) {
+        return parse_u32_auto(v.get<std::string>(), what);
+    }
+    if (v.is_number_unsigned() || (v.is_number_integer() && v.get<long long>() >= 0)) {
+        const unsigned long long n = v.get<unsigned long long>();
+        if (n > 0xffffffffull) {
+            throw std::runtime_error(std::string(what) + " " + key + " does not fit 32 bits");
+        }
+        return static_cast<uint32_t>(n);
+    }
+    throw std::runtime_error(std::string(what) + " " + key +
+                             " must be a non-negative integer or a \"0x...\" string");
+}
+
+TriggerRequestConfig parse_trigger_requests(const json& j, const std::vector<ChannelConfig>& channels,
+                                            uint32_t enabled_mask) {
+    if (!j.is_object()) {
+        throw std::runtime_error("trigger_requests must be an object");
+    }
+    TriggerRequestConfig tr;
+    tr.configured = true;
+    if (j.contains("width_ns")) {
+        const int w = require_int(j, "width_ns");
+        if (w < 0 || w % 8 != 0) {
+            throw std::runtime_error(
+                "trigger_requests.width_ns must be a non-negative multiple of 8 (trigger clock)");
+        }
+        // UM5118 rev. 5 Sec. 1.7: 0x1n70 bits[7:0], 8 ns steps on the 730
+        // (default 2 = 16 ns), so at most 255 * 8 = 2040 ns.
+        if (w / 8 > 0xff) {
+            throw std::runtime_error("trigger_requests.width_ns must be at most 2040 (0x1n70 is 8 bits of 8 ns)");
+        }
+        tr.width_ns = static_cast<uint32_t>(w);
+        tr.width_steps = static_cast<uint32_t>(w / 8);
+    }
+    if (j.contains("channels")) {
+        if (!j.at("channels").is_array() || j.at("channels").empty()) {
+            throw std::runtime_error("trigger_requests.channels must be a non-empty array");
+        }
+        for (const json& c : j.at("channels")) {
+            if (!c.is_number_integer() || c.get<int>() < 0 || c.get<int>() > 15) {
+                throw std::runtime_error("trigger_requests.channels entries must be 0..15");
+            }
+            tr.channel_mask |= 1u << c.get<int>();
+        }
+    } else {
+        tr.channel_mask = enabled_mask;
+    }
+    if ((tr.channel_mask & ~enabled_mask) != 0u) {
+        throw std::runtime_error(
+            "trigger_requests.channels must be enabled channels (the threshold is set from the "
+            "measured baseline)");
+    }
+    for (const ChannelConfig& ch : channels) {
+        if ((tr.channel_mask & (1u << ch.index)) != 0u && ch.threshold < 1) {
+            throw std::runtime_error("channel " + std::to_string(ch.index) +
+                                     " is in trigger_requests and needs threshold >= 1");
+        }
+    }
+    if (j.contains("trg_out")) {
+        tr.trg_out = require_bool(j, "trg_out");
+    }
+    return tr;
+}
+
+AnalogMonitorConfig parse_analog_monitor(const json& j) {
+    if (!j.is_object()) {
+        throw std::runtime_error("analog_monitor must be an object");
+    }
+    AnalogMonitorConfig am;
+    am.configured = true;
+    am.mode = parse_monitor_mode(require_string(j, "mode"));
+    if (am.mode == MonitorMode::VoltageLevel) {
+        am.level_volts = require_number(j, "level_volts");
+        const long code = std::lround(am.level_volts * 4096.0);
+        if (code < 0 || code > 4095) {
+            throw std::runtime_error("analog_monitor.level_volts must be 0 .. 4095/4096 V");
+        }
+        am.level_code = static_cast<uint32_t>(code);
+    } else if (j.contains("level_volts")) {
+        throw std::runtime_error("analog_monitor.level_volts is only used with mode voltage_level");
+    }
+    return am;
+}
+
+std::vector<RegisterWrite> parse_register_writes(const json& j) {
+    if (!j.is_array()) {
+        throw std::runtime_error("register_writes must be an array");
+    }
+    std::vector<RegisterWrite> out;
+    for (const json& w : j) {
+        if (!w.is_object()) {
+            throw std::runtime_error("each register_writes entry must be an object");
+        }
+        RegisterWrite rw;
+        rw.address = parse_u32_field(w, "address", "register_writes");
+        rw.value = parse_u32_field(w, "value", "register_writes");
+        if (w.contains("mask")) {
+            rw.mask = parse_u32_field(w, "mask", "register_writes");
+        }
+        if (rw.address % 4u != 0u || rw.address > 0xfffcu) {
+            throw std::runtime_error("register_writes address " + hex32(rw.address) +
+                                     " must be a multiple of 4 in 0x0000..0xFFFC");
+        }
+        if (rw.mask == 0u) {
+            throw std::runtime_error("register_writes mask must not be 0");
+        }
+        out.push_back(rw);
+    }
+    return out;
 }
 
 bool valid_run_name(const std::string& s) {
@@ -412,6 +577,17 @@ Config load_config(const std::string& path) {
     }
     if (cfg.trigger == TriggerType::Coincidence && !cfg.coincidence) {
         throw std::runtime_error("coincidence trigger requires a coincidence object");
+    }
+
+    if (j.contains("trigger_requests") && !j.at("trigger_requests").is_null()) {
+        cfg.trigger_requests =
+            parse_trigger_requests(j.at("trigger_requests"), cfg.channels, cfg.channel_mask);
+    }
+    if (j.contains("analog_monitor") && !j.at("analog_monitor").is_null()) {
+        cfg.analog_monitor = parse_analog_monitor(j.at("analog_monitor"));
+    }
+    if (j.contains("register_writes") && !j.at("register_writes").is_null()) {
+        cfg.register_writes = parse_register_writes(j.at("register_writes"));
     }
 
     return cfg;

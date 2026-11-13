@@ -10,11 +10,15 @@ struct WaveformEvent {
     uint32_t trigger_time_tag = 0;
     uint32_t channel_mask = 0;
     uint32_t sample_count = 0;
+    // Unwrapped trigger time in 8 ns ticks since the run's acquisition start.
+    // ICX1 files have no such field; the reader copies trigger_time_tag here.
+    uint64_t trigger_time_ticks = 0;
     // Enabled channels, ascending channel number, each sample_count int16 codes.
     std::vector<int16_t> samples;
 };
 
-// 20-byte header (magic ICX1, counter, time tag, mask, sample count) then samples.
+// 28-byte header (magic ICX2, counter, raw time tag, mask, sample count,
+// uint64 unwrapped time tag) then samples. The reader also accepts 20-byte ICX1.
 std::string encode_waveform_event(const WaveformEvent& event);
 std::vector<WaveformEvent> read_waveform_file(const std::filesystem::path& path);
 

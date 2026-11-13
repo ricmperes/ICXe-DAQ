@@ -1,5 +1,6 @@
 #include "digitizer.hpp"
 
+#include "chunks.hpp"
 #include "util.hpp"
 #include "writer.hpp"
 
@@ -7,12 +8,14 @@
 
 #include <CAENDigitizer.h>
 
+#include <algorithm>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -180,6 +183,28 @@ struct PairReadback {
     uint32_t logic_bits = 0;
 };
 
+// One register access: value before, value written, and readback.
+struct RegisterAccess {
+    uint32_t address = 0;
+    uint32_t before = 0;
+    uint32_t written = 0;
+    uint32_t after = 0;
+    uint32_t mask = 0xffffffffu;
+    bool wrote = false;
+    bool matches() const { return !wrote || (after & mask) == (written & mask); }
+};
+
+json register_access_json(const RegisterAccess& a) {
+    json j = {{"address", hex32(a.address)}, {"before", hex32(a.before)}};
+    if (a.wrote) {
+        j["written"] = hex32(a.written);
+        j["mask"] = hex32(a.mask);
+        j["readback"] = hex32(a.after);
+        j["readback_matches"] = a.matches();
+    }
+    return j;
+}
+
 struct Accum {
     double sum = 0;
     double sumsq = 0;
@@ -205,6 +230,26 @@ struct Accum {
         n = 0;
     }
 };
+
+json chunks_json(const ChunkTracker& tracker) {
+    json out = json::array();
+    for (const ChunkInfo& c : tracker.chunks()) {
+        json cj = {{"index", c.index},
+                   {"file", c.file},
+                   {"n_events", c.n_events},
+                   {"first_event_counter", c.first_event_counter},
+                   {"last_event_counter", c.last_event_counter},
+                   {"start_unix_time_ns", c.start_ns},
+                   {"end_unix_time_ns", nullptr},
+                   {"first_waveform_start_unix_time_ns", c.first_waveform_start_ns},
+                   {"last_waveform_end_unix_time_ns", c.last_waveform_end_ns}};
+        if (c.end_ns) {
+            cj["end_unix_time_ns"] = *c.end_ns;
+        }
+        out.push_back(cj);
+    }
+    return out;
+}
 
 class ReadoutBuffer {
 public:
@@ -321,6 +366,11 @@ public:
                      cfg_.connection.use_vme_base_address ? "true" : "false");
         std::fprintf(out, "open_base: %s\n", hex32(open_base_address(cfg_.connection)).c_str());
         std::fflush(out);
+    }
+
+    // Bench access for the reg command: no reset, no programming.
+    RegisterAccess register_command(uint32_t address, std::optional<uint32_t> value) {
+        return access_masked(address, value);
     }
 
     void check_target() const {
@@ -631,20 +681,11 @@ public:
                   "external trigger off");
             check(CAEN_DGTZ_SetSWTriggerMode(handle_, CAEN_DGTZ_TRGMODE_DISABLED), "SW trigger off");
             const CoincidenceProgram& coin = *cfg_.coincidence;
-            for (ChannelResult& result : results_) {
-                if (!result.enabled) {
-                    continue;
-                }
-                const double baseline = result.measured ? result.mean
-                                                        : target_baseline_adc(result.target_percent);
-                result.threshold_adc = threshold_adc(result.polarity == Polarity::Positive, baseline,
-                                                     result.threshold_counts);
-                check(CAEN_DGTZ_SetChannelTriggerThreshold(
-                          handle_, static_cast<uint32_t>(result.index),
-                          static_cast<uint32_t>(result.threshold_adc)),
-                      "SetChannelTriggerThreshold");
-            }
-            check(CAEN_DGTZ_SetChannelSelfTrigger(handle_, CAEN_DGTZ_TRGMODE_ACQ_ONLY,
+            program_thresholds(cfg_.channel_mask);
+            check(CAEN_DGTZ_SetChannelSelfTrigger(handle_,
+                                                  cfg_.trigger_requests.trg_out
+                                                      ? CAEN_DGTZ_TRGMODE_ACQ_AND_EXTOUT
+                                                      : CAEN_DGTZ_TRGMODE_ACQ_ONLY,
                                                   coin.participant_mask),
                   "enable pair self trigger");
             pair_readback_.clear();
@@ -666,6 +707,9 @@ public:
             std::fprintf(stderr, "coincidence: 0x810C written=%s majority=%d window_ns=%d\n",
                          hex32(coin.register_810c).c_str(), coin.majority, coin.window_ns);
         }
+        apply_trigger_requests();
+        apply_analog_monitor();
+        apply_register_writes();
         uint32_t rb = 0;
         check(CAEN_DGTZ_ReadRegister(handle_, 0x810C, &rb), "read 0x810C");
         reg_810c_read_ = rb;
@@ -679,7 +723,7 @@ public:
         const fs::path run_dir = make_run_dir();
         fs::copy_file(config_path, run_dir / "config.json", fs::copy_options::overwrite_existing);
         WaveformWriter writer(run_dir, cfg_.waveforms_per_file);
-        const std::string started = utc_now_iso();
+        const UtcStamp started = utc_now_stamp();
         std::string stop = "error";
         json meta = make_metadata(started);
         write_metadata(run_dir / "metadata.json", meta);
@@ -694,6 +738,16 @@ public:
         timespec last_status = start;
         int last_file = 0;
         start_sw("run");
+        // The trigger time tag counts from this start. acq_start_ns_ is taken
+        // just before SWStartAcquisition, after started.
+        TimeTagUnwrapper unwrapper(acq_start_ns_);
+        ChunkTracker chunks(started.unix_ns, acq_start_ns_, pre_actual_, record_read_);
+        meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
+        const auto update_files = [&] {
+            meta["events_written"] = writer.events_written();
+            meta["files"] = writer.filenames();
+            meta["chunks"] = chunks_json(chunks);
+        };
 
         timespec next_trigger = start;
         const bool rate = cfg_.trigger == TriggerType::Rate;
@@ -720,13 +774,18 @@ public:
                     if (max_events > 0 && writer.events_written() >= max_events) {
                         return false;
                     }
+                    // PC time after ReadData returned: the event happened before it.
+                    const int64_t read_ns = unix_now_ns();
                     WaveformEvent event;
                     event.event_counter = info.EventCounter;
                     event.trigger_time_tag = info.TriggerTimeTag;
+                    event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
                     event.channel_mask = cfg_.channel_mask;
                     event.sample_count = record_read_;
                     event.samples = extract_enabled(ev, record_read_);
                     writer.write_event(event);
+                    chunks.add_event(writer.file_index(), writer.filenames().back(),
+                                     event.event_counter, event.trigger_time_ticks);
                     return !(max_events > 0 && writer.events_written() >= max_events);
                 });
                 if (max_events > 0 && writer.events_written() >= max_events) {
@@ -736,8 +795,7 @@ public:
                 const bool file_changed = writer.file_index() != last_file;
                 if (file_changed || elapsed_s(mono_now(), last_status) >= 1.0) {
                     writer.flush();
-                    meta["events_written"] = writer.events_written();
-                    meta["files"] = writer.filenames();
+                    update_files();
                     write_metadata(run_dir / "metadata.json", meta);
                     std::fprintf(stdout, "events=%llu file=%d\n",
                                  static_cast<unsigned long long>(writer.events_written()),
@@ -760,9 +818,13 @@ public:
             }
         } catch (...) {
             writer.flush();
-            meta["events_written"] = writer.events_written();
-            meta["files"] = writer.filenames();
-            meta["ended_utc"] = utc_now_iso();
+            // The last chunk ends no earlier than its last waveform, and the run
+            // ends no earlier than the last chunk.
+            const int64_t chunk_end = chunks.close(unix_now_ns());
+            update_files();
+            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
+            meta["ended_utc"] = ended.iso;
+            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
             meta["stop_reason"] = "error";
             write_metadata(run_dir / "metadata.json", meta);
             throw;
@@ -773,9 +835,11 @@ public:
             acq_on_ = false;
         }
         writer.flush();
-        meta["events_written"] = writer.events_written();
-        meta["files"] = writer.filenames();
-        meta["ended_utc"] = utc_now_iso();
+        const int64_t chunk_end = chunks.close(unix_now_ns());
+        update_files();
+        const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
+        meta["ended_utc"] = ended.iso;
+        meta["ended_utc_unix_time_ns"] = ended.unix_ns;
         meta["stop_reason"] = stop;
         write_metadata(run_dir / "metadata.json", meta);
         std::fprintf(stdout, "events=%llu file=%d stop=%s\n",
@@ -902,6 +966,9 @@ private:
                                      ": acquisition control 0x8100 is not SW_CONTROLLED (" +
                                      hex32(control) + ")");
         }
+        // The board resets the trigger time tag when acquisition starts. This
+        // PC time is taken before, so it is a lower bound for that reset.
+        acq_start_ns_ = unix_now_ns();
         const CAEN_DGTZ_ErrorCode err = CAEN_DGTZ_SWStartAcquisition(handle_);
         if (err != CAEN_DGTZ_Success) {
             uint32_t status = 0;
@@ -1142,6 +1209,129 @@ private:
         }
     }
 
+    // Read, optionally write (value & mask merged into the old value), read back.
+    RegisterAccess access_masked(uint32_t address, std::optional<uint32_t> value,
+                                 uint32_t mask = 0xffffffffu) {
+        RegisterAccess a;
+        a.address = address;
+        a.mask = mask;
+        check(CAEN_DGTZ_ReadRegister(handle_, address, &a.before), "register read");
+        a.after = a.before;
+        if (value) {
+            a.wrote = true;
+            a.written = (a.before & ~mask) | (*value & mask);
+            check(CAEN_DGTZ_WriteRegister(handle_, address, a.written), "register write");
+            check(CAEN_DGTZ_ReadRegister(handle_, address, &a.after), "register readback");
+        }
+        return a;
+    }
+
+    // Thresholds relative to the measured baseline (or the target when the
+    // baseline step was skipped), for the channels in mask.
+    void program_thresholds(uint32_t mask) {
+        for (ChannelResult& result : results_) {
+            if (!result.enabled || (mask & (1u << result.index)) == 0u) {
+                continue;
+            }
+            const double baseline =
+                result.measured ? result.mean : target_baseline_adc(result.target_percent);
+            result.threshold_adc = threshold_adc(result.polarity == Polarity::Positive, baseline,
+                                                 result.threshold_counts);
+            check(CAEN_DGTZ_SetChannelTriggerThreshold(handle_, static_cast<uint32_t>(result.index),
+                                                       static_cast<uint32_t>(result.threshold_adc)),
+                  "SetChannelTriggerThreshold");
+        }
+    }
+
+    // trigger_requests: thresholds and the self-trigger pulse width (0x1n70)
+    // without letting the requests start the acquisition, unless the trigger
+    // type is coincidence. MON/Σ in majority mode counts these requests.
+    void apply_trigger_requests() {
+        const TriggerRequestConfig& tr = cfg_.trigger_requests;
+        width_access_.clear();
+        shape_access_.clear();
+        if (!tr.configured) {
+            return;
+        }
+        uint32_t mask = tr.channel_mask;
+        if (cfg_.trigger == TriggerType::Coincidence) {
+            // Thresholds and enables were set with the pairs; widen them too.
+            mask |= cfg_.coincidence->participant_mask;
+        } else {
+            program_thresholds(mask);
+            if (tr.trg_out) {
+                check(CAEN_DGTZ_SetChannelSelfTrigger(handle_, CAEN_DGTZ_TRGMODE_EXTOUT_ONLY, mask),
+                      "self trigger to TRG-OUT");
+            }
+        }
+        for (int ch = 0; ch < 16; ++ch) {
+            if ((mask & (1u << ch)) == 0u) {
+                continue;
+            }
+            const uint32_t width_addr = 0x1070u | (static_cast<uint32_t>(ch) << 8);
+            std::optional<uint32_t> width;
+            if (tr.width_steps > 0u) {
+                width = tr.width_steps;
+            }
+            const RegisterAccess w = access_masked(width_addr, width);
+            width_access_.push_back(w);
+            std::fprintf(stderr, "trigger_requests: ch%d 0x1n70 addr=%s before=%s", ch,
+                         hex32(width_addr).c_str(), hex32(w.before).c_str());
+            if (w.wrote) {
+                std::fprintf(stderr, " written=%s readback=%s%s", hex32(w.written).c_str(),
+                             hex32(w.after).c_str(),
+                             w.matches() ? "" : "  WARNING: board did not keep the width");
+            }
+            std::fprintf(stderr, "\n");
+            if ((ch % 2) == 0 || (mask & (1u << (ch - 1))) == 0u) {
+                // 0x1n84 is the pair register (n = even channel): logic in
+                // bits[1:0]; bit[2] = 0 pulse of 0x1n70 width (default),
+                // 1 = over/under-threshold level (UM5118 Sec. 1.9). Only logged.
+                const uint32_t pair_addr = 0x1084u | (static_cast<uint32_t>(ch & ~1) << 8);
+                const RegisterAccess s = access_masked(pair_addr, std::nullopt);
+                shape_access_.push_back(s);
+                std::fprintf(stderr, "trigger_requests: pair %d-%d 0x1n84 addr=%s value=%s\n",
+                             ch & ~1, (ch & ~1) + 1, hex32(pair_addr).c_str(),
+                             hex32(s.before).c_str());
+            }
+        }
+        std::fprintf(stderr, "trigger_requests: width_ns=%u (%u steps of 8 ns) trg_out=%s\n",
+                     tr.width_ns, tr.width_steps, tr.trg_out ? "true" : "false");
+        std::fflush(stderr);
+    }
+
+    void apply_analog_monitor() {
+        monitor_access_.clear();
+        const AnalogMonitorConfig& am = cfg_.analog_monitor;
+        if (!am.configured) {
+            return;
+        }
+        if (am.mode == MonitorMode::VoltageLevel) {
+            // Vmon = N / 4096 V, 12-bit N at 0x8138.
+            monitor_access_.push_back(access_masked(0x8138u, am.level_code, 0xfffu));
+        }
+        monitor_access_.push_back(access_masked(0x8144u, monitor_mode_bits(am.mode), 0x7u));
+        for (const RegisterAccess& a : monitor_access_) {
+            std::fprintf(stderr, "analog_monitor: %s before=%s written=%s readback=%s%s\n",
+                         hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                         hex32(a.after).c_str(), a.matches() ? "" : "  WARNING: readback differs");
+        }
+        std::fprintf(stderr, "analog_monitor: mode=%s\n", to_string(am.mode));
+        std::fflush(stderr);
+    }
+
+    void apply_register_writes() {
+        raw_access_.clear();
+        for (const RegisterWrite& w : cfg_.register_writes) {
+            const RegisterAccess a = access_masked(w.address, w.value, w.mask);
+            raw_access_.push_back(a);
+            std::fprintf(stderr, "register_writes: %s before=%s written=%s readback=%s%s\n",
+                         hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                         hex32(a.after).c_str(), a.matches() ? "" : "  WARNING: readback differs");
+        }
+        std::fflush(stderr);
+    }
+
     void ensure_readout() {
         if (!readout_) {
             readout_ = std::make_unique<ReadoutBuffer>(handle_);
@@ -1304,7 +1494,7 @@ private:
         return dir;
     }
 
-    json make_metadata(const std::string& started) const {
+    json make_metadata(const UtcStamp& started) const {
         json meta;
         meta["board"] = {
             {"model", board_.model_name},
@@ -1346,6 +1536,12 @@ private:
         meta["pre_trigger_samples_actual"] = pre_actual_;
         meta["post_trigger_samples_actual"] = post_actual_;
         meta["trigger_time_tag_tick_ns"] = kTriggerTimeTagTickNs;
+        meta["trigger_time_tag_wrap_ticks"] = kTriggerTimeTagWrapTicks;
+        meta["waveform_format"] = std::string(kWaveMagic, 4);
+        meta["trigger_time_ticks_note"] =
+            "trigger_time_ticks in each event header is the unwrapped trigger time tag in 8 ns ticks "
+            "since acquisition start. Unix ns = acquisition_start_unix_time_ns + ticks * 8 "
+            "(PC-clock accuracy, about a millisecond).";
         meta["sample_period_ns"] = kSamplePeriodNs;
         meta["event_counter_note"] =
             "event_counter is the digitizer header counter. Baseline software triggers can advance it before the run.";
@@ -1387,6 +1583,51 @@ private:
         }
         meta["trigger"] = trig;
 
+        const TriggerRequestConfig& tr = cfg_.trigger_requests;
+        if (tr.configured) {
+            json widths = json::array();
+            for (const RegisterAccess& a : width_access_) {
+                widths.push_back(register_access_json(a));
+            }
+            json shapes = json::array();
+            for (const RegisterAccess& a : shape_access_) {
+                shapes.push_back(register_access_json(a));
+            }
+            meta["trigger_requests"] = {
+                {"width_ns", tr.width_ns},
+                {"width_steps", tr.width_steps},
+                {"channels", channels_from_mask(tr.channel_mask)},
+                {"trg_out", tr.trg_out},
+                {"width_registers_0x1n70", widths},
+                {"pair_registers_0x1n84", shapes},
+                {"note",
+                 "Thresholds and self-trigger pulse width are programmed. With an external or "
+                 "rate trigger the requests do not start the acquisition; MON/Σ in majority "
+                 "mode and (with trg_out) TRG-OUT see them."},
+            };
+        } else {
+            meta["trigger_requests"] = nullptr;
+        }
+        if (cfg_.analog_monitor.configured) {
+            json regs = json::array();
+            for (const RegisterAccess& a : monitor_access_) {
+                regs.push_back(register_access_json(a));
+            }
+            json am = {{"mode", to_string(cfg_.analog_monitor.mode)}, {"registers", regs}};
+            if (cfg_.analog_monitor.mode == MonitorMode::VoltageLevel) {
+                am["level_volts"] = cfg_.analog_monitor.level_volts;
+                am["level_code"] = cfg_.analog_monitor.level_code;
+            }
+            meta["analog_monitor"] = am;
+        } else {
+            meta["analog_monitor"] = nullptr;
+        }
+        json raw = json::array();
+        for (const RegisterAccess& a : raw_access_) {
+            raw.push_back(register_access_json(a));
+        }
+        meta["register_writes"] = raw;
+
         json channels = json::array();
         for (const ChannelResult& result : results_) {
             json cj = {{"index", result.index},
@@ -1413,10 +1654,14 @@ private:
             channels.push_back(cj);
         }
         meta["channels"] = channels;
-        meta["started_utc"] = started;
+        meta["started_utc"] = started.iso;
+        meta["started_utc_unix_time_ns"] = started.unix_ns;
         meta["ended_utc"] = nullptr;
+        meta["ended_utc_unix_time_ns"] = nullptr;
+        meta["acquisition_start_unix_time_ns"] = nullptr;
         meta["events_written"] = 0;
         meta["files"] = json::array();
+        meta["chunks"] = json::array();
         meta["stop_reason"] = nullptr;
         meta["waveforms_per_file"] = cfg_.waveforms_per_file;
         return meta;
@@ -1454,6 +1699,7 @@ private:
     const Config& cfg_;
     int handle_ = -1;
     bool acq_on_ = false;
+    int64_t acq_start_ns_ = 0;
     BoardReport board_;
     uint32_t record_read_ = 0;
     uint32_t post_percent_read_ = 0;
@@ -1463,6 +1709,10 @@ private:
     uint32_t reg_810c_read_ = 0;
     std::vector<ChannelResult> results_;
     std::vector<PairReadback> pair_readback_;
+    std::vector<RegisterAccess> width_access_;
+    std::vector<RegisterAccess> shape_access_;
+    std::vector<RegisterAccess> monitor_access_;
+    std::vector<RegisterAccess> raw_access_;
     std::unique_ptr<ReadoutBuffer> readout_;
 };
 
@@ -1483,6 +1733,21 @@ void command_run(const Config& cfg, const std::string& config_path, uint64_t max
     session.baseline_if_needed();
     session.arm_trigger();
     session.acquire_run(config_path, max_events);
+}
+
+void command_reg(const Config& cfg, uint32_t address, std::optional<uint32_t> value) {
+    Session session(cfg);
+    session.check_target();
+    const RegisterAccess a = session.register_command(address, value);
+    if (a.wrote) {
+        std::fprintf(stdout, "address=%s before=%s written=%s readback=%s%s\n",
+                     hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                     hex32(a.after).c_str(), a.matches() ? "" : " (differs)");
+    } else {
+        std::fprintf(stdout, "address=%s value=%s\n", hex32(a.address).c_str(),
+                     hex32(a.before).c_str());
+    }
+    std::fflush(stdout);
 }
 
 void command_scope(const Config& cfg, int channel) {

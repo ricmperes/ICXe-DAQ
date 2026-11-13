@@ -28,7 +28,10 @@ The self-test checks buffer-organization choice, JSON loading, and a waveform-fi
 ./build/icxe-daq run   --config config/default.json
 ./build/icxe-daq run   --config config/default.json --max-events 100
 ./build/icxe-daq scope --config config/default.json --channel 0
+./build/icxe-daq reg   --config config/default.json --address 0x1070 [--value 0x7D]
 ```
+
+`reg` reads one register, or writes it and reads it back, without resetting or programming the board. It is meant for bench tests such as the MON/Σ majority test in [docs/mon_test.md](docs/mon_test.md), which also uses the optional `trigger_requests`, `analog_monitor` and `register_writes` config keys ([docs/config.md](docs/config.md)).
 
 `info` prints board identity (model, serial, channel count, ADC bits, ROC/AMC firmware, DPP vs standard waveform, and the link used to open) and exits. If the optical link is down the open fails with `CAEN_DGTZ_DigitizerNotFound` (or a communication error) and points at the link-check script.
 
@@ -159,20 +162,21 @@ data/<name>_<UTC>/
   wf_00001.bin
 ```
 
-`config.json` is a copy of the JSON that was loaded. `metadata.json` holds board info, firmware, link, `Nb`, the real record length, requested and actual pre/post samples, and per-channel DAC, baseline mean, RMS, and polarity. The trigger time tag is stored raw. `trigger_time_tag_tick_ns` is 8 (125 MHz). The sample period is 2 ns (500 MS/s).
+`config.json` is a copy of the JSON that was loaded. `metadata.json` holds board info, firmware, link, `Nb`, the real record length, requested and actual pre/post samples, per-channel DAC, baseline mean, RMS, and polarity, run start/end times, and a `chunks` list with the time span of each `wf_*.bin` (see [docs/data_format.md](docs/data_format.md)). The trigger time tag is stored raw and also unwrapped into a 64-bit tick count. `trigger_time_tag_tick_ns` is 8 (125 MHz). The sample period is 2 ns (500 MS/s).
 
 Events are concatenated with no extra file header. Each event is little-endian:
 
 | Bytes | Field |
 | --- | --- |
-| 4 | magic `ICX1` |
+| 4 | magic `ICX2` |
 | 4 | `uint32` event counter (digitizer header) |
 | 4 | `uint32` trigger time tag, raw |
 | 4 | `uint32` channel mask |
 | 4 | `uint32` sample count |
+| 8 | `uint64` trigger time ticks, unwrapped (8 ns since acquisition start) |
 | `2 * Nch * Ns` | `int16` ADC codes |
 
-That is a 20-byte header, then samples. Only enabled channels are stored, in ascending channel number. 14-bit codes sit in 16-bit words. Disabled channels are omitted. A 1020-sample, 16-channel event is about 32 KB plus the header.
+That is a 28-byte header, then samples. Runs written before this format use `ICX1`, the same header without the 8-byte tick field (20 bytes). Only enabled channels are stored, in ascending channel number. 14-bit codes sit in 16-bit words. Disabled channels are omitted. A 1020-sample, 16-channel event is about 32 KB plus the header.
 
 ```bash
 python3 tools/read_waveforms.py data/v1730sb_<UTC>/wf_00000.bin \

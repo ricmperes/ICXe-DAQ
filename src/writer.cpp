@@ -46,6 +46,7 @@ std::string encode_waveform_event(const WaveformEvent& event) {
     append_u32_le(out, event.trigger_time_tag);
     append_u32_le(out, event.channel_mask);
     append_u32_le(out, event.sample_count);
+    append_u64_le(out, event.trigger_time_ticks);
     for (int16_t s : event.samples) {
         append_u16_le(out, static_cast<uint16_t>(s));
     }
@@ -73,30 +74,40 @@ std::vector<WaveformEvent> read_waveform_file(const std::filesystem::path& path)
     std::vector<WaveformEvent> events;
     std::size_t off = 0;
     while (off < bytes.size()) {
-        if (bytes.size() - off < kWaveHeaderBytes) {
+        if (bytes.size() - off < 4) {
             throw std::runtime_error("truncated waveform header in " + path.string());
         }
         const uint8_t* p = bytes.data() + off;
-        if (std::memcmp(p, kWaveMagic, 4) != 0) {
-            throw std::runtime_error("bad ICX1 magic in " + path.string());
+        uint32_t header_bytes = 0;
+        if (std::memcmp(p, kWaveMagic, 4) == 0) {
+            header_bytes = kWaveHeaderBytes;
+        } else if (std::memcmp(p, kWaveMagicV1, 4) == 0) {
+            header_bytes = kWaveHeaderBytesV1;
+        } else {
+            throw std::runtime_error("bad ICX1/ICX2 magic in " + path.string());
+        }
+        if (bytes.size() - off < header_bytes) {
+            throw std::runtime_error("truncated waveform header in " + path.string());
         }
         WaveformEvent ev;
         ev.event_counter = read_u32_le(p + 4);
         ev.trigger_time_tag = read_u32_le(p + 8);
         ev.channel_mask = read_u32_le(p + 12);
         ev.sample_count = read_u32_le(p + 16);
+        ev.trigger_time_ticks = header_bytes == kWaveHeaderBytes ? read_u64_le(p + 20)
+                                                                 : ev.trigger_time_tag;
         const std::size_t n = static_cast<std::size_t>(popcount_u32(ev.channel_mask)) *
                               static_cast<std::size_t>(ev.sample_count);
         const std::size_t nbytes = n * 2;
-        if (bytes.size() - off < kWaveHeaderBytes + nbytes) {
+        if (bytes.size() - off < header_bytes + nbytes) {
             throw std::runtime_error("truncated waveform payload in " + path.string());
         }
         ev.samples.resize(n);
-        const uint8_t* s = p + kWaveHeaderBytes;
+        const uint8_t* s = p + header_bytes;
         for (std::size_t i = 0; i < n; ++i) {
             ev.samples[i] = static_cast<int16_t>(read_u16_le(s + i * 2));
         }
-        off += kWaveHeaderBytes + nbytes;
+        off += header_bytes + nbytes;
         events.push_back(std::move(ev));
     }
     return events;
