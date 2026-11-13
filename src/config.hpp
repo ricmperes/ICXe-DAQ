@@ -20,8 +20,9 @@ enum class MonitorMode { Majority, Test, BufferOccupancy, VoltageLevel };
 // output and TRG-OUT can see them.
 struct TriggerRequestConfig {
     bool configured = false;
-    // Self-trigger pulse width, register 0x1n70, in 8 ns trigger-clock steps.
-    // 0 leaves the register as the reset left it (16 ns per UM2792).
+    // Self-trigger pulse width, register 0x1n70 bits[7:0], in 8 ns trigger-clock
+    // steps (max 2040 ns). Used while 0x1n84 bit[2] = 0 (pulse, the default).
+    // 0 leaves the register as the reset left it (2 = 16 ns, UM5118).
     uint32_t width_ns = 0;
     uint32_t width_steps = 0;
     // Channels whose threshold is programmed. Defaults to every enabled channel.

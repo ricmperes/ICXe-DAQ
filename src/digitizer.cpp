@@ -1285,7 +1285,8 @@ private:
             std::fprintf(stderr, "\n");
             if ((ch % 2) == 0 || (mask & (1u << (ch - 1))) == 0u) {
                 // 0x1n84 is the pair register (n = even channel): logic in
-                // bits[1:0] and the self-trigger shape. Only logged here.
+                // bits[1:0]; bit[2] = 0 pulse of 0x1n70 width (default),
+                // 1 = over/under-threshold level (UM5118 Sec. 1.9). Only logged.
                 const uint32_t pair_addr = 0x1084u | (static_cast<uint32_t>(ch & ~1) << 8);
                 const RegisterAccess s = access_masked(pair_addr, std::nullopt);
                 shape_access_.push_back(s);

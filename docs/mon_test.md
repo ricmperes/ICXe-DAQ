@@ -2,13 +2,15 @@
 
 Goal: find out whether the V1730 analog majority output can serve as a cheap 2-fold coincidence trigger with a 1 µs window. In the full system, the MON/Σ outputs of all boards are summed in a LeCroy 428 fan-in, discriminated by a CAEN N96, and fanned out to TRG-IN of every board.
 
-What the manual (UM2792 rev. 2) says, and what is still open:
+What the manuals (UM2792 rev. 2, UM5118 rev. 5 in `caen_documents/`) say, and what is still open:
 
 | Item | Manual | Open |
 | --- | --- | --- |
-| MON/Σ majority mode | 0x8144 bits[2:0] = 000 (default). Voltage proportional to the number of channels over threshold. | Step height: the text says 125 mV, the figure 1.25 mV. |
-| Self-trigger pulse | 0x1n84 selects over-threshold level or a pulse; the pulse width is 0x1n70. The default after reset is "OR of two 16 ns pulses". | Whether MON counts the stretched pulse or the raw over-threshold level. Field width and unit of 0x1n70 (DPP manuals: 8 bits of 8 ns). |
-| Requests without self-triggering | The self-trigger can be routed to acquisition, TRG-OUT, both, or neither. | Whether MON counts a channel whose request is routed nowhere. |
+| MON/Σ majority mode | 0x8144 bits[2:0] = 000 (default). Voltage proportional to the number of channels over threshold. Voltage-level mode: 0x8138, 0.244 mV per LSB into 50 Ω. | Step height: the UM2792 text says 125 mV, its figure 1.25 mV; UM5118 gives no number. |
+| Self-trigger pulse | 0x1n84 bit[2] = 0 (default): a pulse whose width is 0x1n70 bits[7:0] in 8 ns steps (default 2 = 16 ns, max 255 = 2040 ns); bit[2] = 1: over/under-threshold level. Needs AMC ≥ 0.2 (ours: 0.5). | Whether MON counts the stretched pulse or the raw over-threshold level. |
+| Requests without self-triggering | The self-trigger can be routed to acquisition (0x810C), TRG-OUT (0x8110), both, or neither. | Whether MON counts a channel whose request is routed nowhere. |
+| Self-trigger polarity | One bit for the whole board, 0x8000 bit[6] (0 = over, 1 = under threshold). | None: all channels on a board must have the same pulse polarity for self-triggering. |
+| Overlapping triggers | 0x8000 bit[1] = 1 accepts them: the running event is closed early and storage continues in the next buffer, so events have different lengths (UM2792 Fig. 8.8). | Exactly which samples the shortened event and the next event cover. |
 
 ## Config keys used
 
@@ -29,7 +31,7 @@ See [config.md](config.md) for the full key reference.
 ./build/icxe-daq reg --config config/mon_test.json --address 0x1070 --value 0xFFFFFFFF
 ```
 
-The last readback shows which bits of 0x1n70 exist; the largest width is (readback) × 8 ns. `reg` does not reset the board. The next `run` resets it, which restores the defaults. Note the values here.
+UM5118 says only bits[7:0] exist, so the readback should be `0xff` (2040 ns); anything else is worth noting. 0x1084 should read 0x3 after a reset (OR, pulse mode). `reg` does not reset the board. The next `run` resets it, which restores the defaults.
 
 ## Step 1: does MON show a ~1 µs step per hit?
 
@@ -37,7 +39,7 @@ The last readback shows which bits of 0x1n70 exist; the largest width is (readba
 2. `./build/icxe-daq run --config config/mon_test.json`. The baseline step runs first, then 60 s of acquisition.
 3. On the scope, each hit should be a step lasting about `width_ns`. Repeat with `width_ns` 16, 200 and 1000.
    * Step length follows `width_ns`: MON uses the stretched pulse. Continue.
-   * Step length follows the input pulse only: MON uses the over-threshold level. Try `register_writes` on 0x1n84 (see step 0) to change the shape. If nothing works, this approach cannot give a 1 µs window.
+   * Step length follows the input pulse only: MON uses the over-threshold level, and this approach cannot give a 1 µs window. Check that 0x1n84 bit[2] reads 0 in the stderr log. For comparison, `"register_writes": [{"address": "0x1084", "value": "0x4", "mask": "0x4"}]` switches pair 0-1 to the level shape.
    * No steps at all: set `trigger_requests.trg_out` to `true` and repeat.
 4. With a pulser into both channels, two hits that overlap in time should give a double-height step.
 
@@ -60,11 +62,30 @@ MON/Σ ──► 428 section (inverting) ──► N96 ──► 428 / N96 outpu
 
 Keep the scope on MON while doing this. The trigger lands up to `width_ns` after the first hit, plus the delay through the NIM chain, so check in the stored waveforms that the first hit is still inside the 1.5 µs pre-trigger.
 
+## Step 4 (optional): digital 2-of-4 on TRG-OUT
+
+Fallback that needs no analog sum, for a trigger made only from detectors on one board (e.g. the 4 PMTs). With one detector per channel pair and the pair logic set to one channel, TRG-OUT can output a majority of the pair requests (0x8110 bits[9:8] = 10, level in bits[12:10]; UM5118 Sec. 1.23). With 1 µs request pulses, this is a 2-fold coincidence within 1 µs. Example for channels 0 and 2 on pairs 0 and 1, pairs switched to "only even channel":
+
+```json
+"trigger_requests": {"width_ns": 1000, "channels": [0, 2], "trg_out": true},
+"register_writes": [
+  {"address": "0x1084", "value": "0x1", "mask": "0x3"},
+  {"address": "0x1284", "value": "0x1", "mask": "0x3"},
+  {"address": "0x8110", "value": "0x603", "mask": "0xC0001FFF"}
+]
+```
+
+`0x603` = pairs 0 and 1 enabled, majority mode, level 1, i.e. at least 2 requests. The mask also clears bits 31 and 30 (software trigger and TRG-IN to TRG-OUT, both 1 after reset), otherwise a TRG-OUT → TRG-IN cable loops every trigger back. Check TRG-OUT on the scope, then cable it to TRG-IN.
+
+## Step 5: overlapping triggers
+
+With a pulser giving two triggers 2 µs apart (inside one 5 µs window), add `{"address": "0x8000", "value": "0x2", "mask": "0x2"}` to `register_writes`. Today's writer requires every event to have the full record length and stops with "event size ... does not match record length" when the board shortens an event. That error alone shows overlap acceptance works. Seeing which samples each event covers needs the writer change planned for the multi-board version.
+
 ## Results to note
 
 | Quantity | Value |
 | --- | --- |
-| 0x1n70 default and implemented bits | |
+| 0x1n70 default and readback of 0xFFFFFFFF | |
 | 0x1n84 default | |
 | MON step follows `width_ns`? | |
 | `trg_out` needed? | |
@@ -72,3 +93,5 @@ Keep the scope on MON while doing this. The trigger lands up to `width_ns` after
 | Singles rate per channel | |
 | 2-fold rate at 200 / 500 / 1000 / 2000 ns | |
 | NIM chain delay (TRG-IN after first hit) | |
+| TRG-OUT 2-of-N majority works? (step 4) | |
+| Overlapping trigger accepted, shortened event? (step 5) | |

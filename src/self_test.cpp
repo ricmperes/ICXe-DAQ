@@ -371,6 +371,10 @@ void test_bench_keys(const fs::path& dir) {
 
     CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"width_ns\": 1001}"); },
                       "multiple of 8"));
+    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"width_ns\": 2048}"); },
+                      "at most 2040"));
+    CHECK(load_with(text, path, "\"trigger_requests\": {\"width_ns\": 2040}")
+              .trigger_requests.width_steps == 255u);
     CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"channels\": [5]}"); },
                       "enabled channels"));
 

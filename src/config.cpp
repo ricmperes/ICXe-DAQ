@@ -278,11 +278,10 @@ TriggerRequestConfig parse_trigger_requests(const json& j, const std::vector<Cha
             throw std::runtime_error(
                 "trigger_requests.width_ns must be a non-negative multiple of 8 (trigger clock)");
         }
-        // The field width of 0x1n70 in the standard firmware is not documented.
-        // The DPP manuals give 8 bits (2040 ns); the run reads the value back
-        // and stops if the board does not keep it.
-        if (w / 8 > 0xffff) {
-            throw std::runtime_error("trigger_requests.width_ns is larger than 16 bits of 8 ns steps");
+        // UM5118 rev. 5 Sec. 1.7: 0x1n70 bits[7:0], 8 ns steps on the 730
+        // (default 2 = 16 ns), so at most 255 * 8 = 2040 ns.
+        if (w / 8 > 0xff) {
+            throw std::runtime_error("trigger_requests.width_ns must be at most 2040 (0x1n70 is 8 bits of 8 ns)");
         }
         tr.width_ns = static_cast<uint32_t>(w);
         tr.width_steps = static_cast<uint32_t>(w / 8);

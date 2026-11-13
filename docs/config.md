@@ -103,7 +103,7 @@ All three are optional and absent from `config/default.json`. `config/mon_test.j
 | Path | Type | Default | Allowed | What it does |
 | --- | --- | --- | --- | --- |
 | `trigger_requests` | object or null | absent | object | Programs thresholds (baseline ± `channels[].threshold`) and the self-trigger pulse width on the listed channels, also when `trigger.type` is `external` or `rate`. The requests then do not start the acquisition, but MON/Σ majority and (with `trg_out`) TRG-OUT see them. With `coincidence`, the pair channels also get the width. |
-| `trigger_requests.width_ns` | integer | `0` (register left at reset value, 16 ns per UM2792) | multiple of 8 | Writes 0x1n70 = `width_ns / 8`. A readback that differs is a stderr WARNING; the board's field width is not documented for this firmware. |
+| `trigger_requests.width_ns` | integer | `0` (register left at reset value, 16 ns) | multiple of 8, at most 2040 | Writes 0x1n70 = `width_ns / 8` (bits[7:0], UM5118 Sec. 1.7). Used while 0x1n84 bit[2] = 0 (pulse, the default). A readback that differs is a stderr WARNING. |
 | `trigger_requests.channels` | array of integers | every enabled channel | enabled channels with `threshold >= 1` | Channels that get threshold and width. |
 | `trigger_requests.trg_out` | boolean | `false` | `true` or `false` | Also routes the requests to TRG-OUT (`EXTOUT_ONLY`; with `coincidence`, `ACQ_AND_EXTOUT`). |
 | `analog_monitor.mode` | string | required in the object | `majority`, `test`, `buffer_occupancy`, `voltage_level` | MON/Σ mode, 0x8144 bits[2:0] = 0, 1, 3, 4. `majority` is proportional to the number of channels over threshold. |
