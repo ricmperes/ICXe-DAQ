@@ -85,13 +85,16 @@ With a pulser giving two triggers 2 µs apart (inside one 5 µs window), add `{"
 
 | Quantity | Value |
 | --- | --- |
-| 0x1n70 default and readback of 0xFFFFFFFF | |
-| 0x1n84 default | |
-| MON step follows `width_ns`? | |
-| `trg_out` needed? | |
-| Step height (1 hit / 2 hits), MON noise | |
+| 0x1n70 default and readback of 0xFFFFFFFF | 0x2 (16 ns) / 0xff (2040 ns), as in UM5118 |
+| 0x1n84 default | 0x3 (OR, pulse mode) |
+| MON step follows `width_ns`? | Yes: 1000 ns step at `width_ns` = 1000 with a 200 ns input pulse (ch0 only); 200 ns setting also matches |
+| `trg_out` needed? | No |
+| Step height (1 hit / 2 hits), MON noise | 125 mV / 250 mV, positive, noise about 5 mV peak-to-peak |
+| MON counts channels or couples? | Couples: ch0 + ch1 (same pair) gives one 125 mV step, ch0 + ch2 gives 250 mV |
+| Delay from input pulse to MON step | About 200 ns (7.5 m cable fan-out to digitizer, 0.5 m fan-out to scope) |
 | Singles rate per channel | |
 | 2-fold rate at 200 / 500 / 1000 / 2000 ns | |
+| 2-fold trigger through 428 (inverted) + N96 at 170 mV | Works: ch0 + ch2 trigger the board, a single channel does not |
 | NIM chain delay (TRG-IN after first hit) | |
 | TRG-OUT 2-of-N majority works? (step 4) | |
 | Overlapping trigger accepted, shortened event? (step 5) | |
