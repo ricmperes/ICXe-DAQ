@@ -14,7 +14,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -42,14 +41,6 @@ bool throws_with(F&& fn, const std::string& fragment) {
         return std::string(ex.what()).find(fragment) != std::string::npos;
     }
     return false;
-}
-
-std::string read_text(const fs::path& path) {
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("cannot read " + path.string());
-    }
-    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 void replace_once(std::string& text, const std::string& from, const std::string& to) {
@@ -329,8 +320,41 @@ void test_coincidence() {
     CHECK(nominal_dac(15) > nominal_dac(85));
 }
 
-void test_config(const std::string& config_path, const fs::path& dir) {
-    const Config cfg = load_config(config_path);
+// Fixed fixture for test_config, independent of the lab's config/default.json.
+const char* kConfigFixture = R"({
+  "name": "fixture",
+  "output_directory": "data",
+  "waveforms_per_file": 1000,
+  "record_length": 1020,
+  "pre_trigger_samples": 200,
+  "n_buffers": null,
+  "connection": {
+    "link_type": "optical",
+    "link_num": 0,
+    "conet_node": 0,
+    "vme_base_address": "0x32140000",
+    "use_vme_base_address": false
+  },
+  "baseline": {"apply_on_start": true},
+  "channels": [
+    {"index": 0, "polarity": "negative", "target_percent": 85, "threshold": 30},
+    {"index": 1, "polarity": "negative", "target_percent": 85, "threshold": 30},
+    {"index": 2, "polarity": "negative", "target_percent": 85, "threshold": 30}
+  ],
+  "trigger": {
+    "type": "external",
+    "io_level": "NIM",
+    "coincidence": {"majority": 0, "window_ns": 48, "pairs": [{"channels": [0, 1], "logic": "and"}]}
+  }
+})";
+
+void test_config(const fs::path& dir) {
+    const fs::path config_path = dir / "config_fixture.json";
+    {
+        std::ofstream out(config_path);
+        out << kConfigFixture;
+    }
+    const Config cfg = load_config(config_path.string());
     CHECK(cfg.connection.link_type == "optical");
     CHECK(cfg.connection.vme_base_address == 0x32140000u);
     CHECK(!cfg.connection.use_vme_base_address);
@@ -350,7 +374,7 @@ void test_config(const std::string& config_path, const fs::path& dir) {
     CHECK(cfg.coincidence.has_value());
     CHECK(cfg.baseline.apply_on_start);
 
-    std::string text = read_text(config_path);
+    const std::string text = kConfigFixture;
     std::string unknown = text;
     replace_once(unknown, "\"link_type\": \"optical\"", "\"link_type\": \"banana\"");
     const fs::path bad_path = dir / "bad_link.json";
@@ -595,7 +619,8 @@ void test_writer(const fs::path& dir) {
     const fs::path trunc_path = run / "trunc.bin";
     {
         std::ofstream out(trunc_path, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(trunc.data()), static_cast<std::streamsize>(trunc.size()));
+        out.write(reinterpret_cast<const char*>(trunc.data()),
+                  static_cast<std::streamsize>(trunc.size()));
     }
     CHECK(throws_with([&] { read_waveform_file(trunc_path); }, "truncated"));
 
@@ -605,7 +630,8 @@ void test_writer(const fs::path& dir) {
 }  // namespace
 
 int run_self_test(const std::string& config_path) {
-    const fs::path dir = fs::path(config_path).parent_path().parent_path() / "build" / "selftest-data";
+    const fs::path project_dir = fs::path(config_path).parent_path().parent_path();
+    const fs::path dir = project_dir / "build" / "selftest-data";
     fs::create_directories(dir);
     try {
         test_utc_stamp();
@@ -614,7 +640,7 @@ int run_self_test(const std::string& config_path) {
         test_common_sample_count();
         test_sample_count_summary();
         test_coincidence();
-        test_config(config_path, dir);
+        test_config(dir);
         test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {
