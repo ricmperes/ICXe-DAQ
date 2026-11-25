@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -116,13 +117,13 @@ void test_chunks() {
 
     // Chunks: record 1020 samples (2040 ns), pre-trigger 204 samples (408 ns).
     const int64_t run_start = acq - 5000000;  // run start 5 ms before acquisition
-    ChunkTracker tr(run_start, acq, 204, 1020);
+    ChunkTracker tr(run_start, acq, 204);
     // ticks of 10 events; 4 per file -> files 0, 0, 0, 0, 1, 1, 1, 1, 2, 2
     const uint64_t ticks[] = {10, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
     for (int i = 0; i < 10; ++i) {
         const int file = i / 4;
         tr.add_event(file, "wf_0000" + std::to_string(file) + ".bin", static_cast<uint32_t>(i),
-                     ticks[i]);
+                     ticks[i], 1020);
     }
     CHECK(tr.chunks().size() == 3);
     CHECK(!tr.chunks().back().end_ns.has_value());
@@ -150,25 +151,86 @@ void test_chunks() {
 
     // Overlapping waveforms at a boundary: the earlier chunk keeps its waveform.
     {
-        ChunkTracker ov(acq, acq, 204, 1020);
-        ov.add_event(0, "wf_00000.bin", 0, 1000);
-        ov.add_event(1, "wf_00001.bin", 1, 1100);  // 800 ns later, record is 2040 ns
-        CHECK(*ov.chunks()[0].end_ns == ov.waveform_end_ns(1000));
-        CHECK(ov.chunks()[1].start_ns == ov.waveform_end_ns(1000));
+        ChunkTracker ov(acq, acq, 204);
+        ov.add_event(0, "wf_00000.bin", 0, 1000, 1020);
+        ov.add_event(1, "wf_00001.bin", 1, 1100, 1020);  // 800 ns later, record is 2040 ns
+        CHECK(*ov.chunks()[0].end_ns == ov.waveform_end_ns(1000, 1020));
+        CHECK(ov.chunks()[1].start_ns == ov.waveform_end_ns(1000, 1020));
     }
     // Clock drift: a last waveform after the PC stop time extends the last chunk.
     {
-        ChunkTracker dr(acq, acq, 0, 1000);
-        dr.add_event(0, "wf_00000.bin", 0, 1000000);
+        ChunkTracker dr(acq, acq, 0);
+        dr.add_event(0, "wf_00000.bin", 0, 1000000, 1000);
         const int64_t end = dr.close(acq + 1000);
-        CHECK(end == dr.waveform_end_ns(1000000));
+        CHECK(end == dr.waveform_end_ns(1000000, 1000));
     }
     // A trigger right at the start never moves the first chunk before the run start.
     {
-        ChunkTracker early(acq, acq, 1000, 1020);
-        early.add_event(0, "wf_00000.bin", 0, 0);
+        ChunkTracker early(acq, acq, 1000);
+        early.add_event(0, "wf_00000.bin", 0, 0, 1020);
         CHECK(early.chunks()[0].start_ns == acq);
     }
+    // An event shortened by an overlapping trigger ends after its own sample count.
+    {
+        ChunkTracker short_event(acq, acq, 204);
+        short_event.add_event(0, "wf_00000.bin", 0, 1000, 1020);
+        short_event.add_event(0, "wf_00000.bin", 1, 1100, 300);
+        CHECK(short_event.waveform_end_ns(1100, 300) == short_event.waveform_start_ns(1100) + 600);
+        const auto& short_chunks = short_event.chunks();
+        CHECK(short_chunks[0].last_waveform_end_ns == short_event.waveform_end_ns(1000, 1020));
+        short_event.add_event(0, "wf_00000.bin", 2, 1500, 1020);
+        CHECK(short_chunks[0].last_waveform_end_ns == short_event.waveform_end_ns(1500, 1020));
+    }
+}
+
+void test_common_sample_count() {
+    uint32_t sizes[16] = {};
+    sizes[0] = 2500;
+    sizes[2] = 2500;
+    sizes[5] = 7;
+    CHECK(common_sample_count(sizes, 0x5u) == 2500);
+    CHECK(common_sample_count(sizes, 0x20u) == 7);
+    CHECK(throws_with([&] { common_sample_count(sizes, 0x25u); },
+                      "channel 5 has 7 samples, channel 0 has 2500"));
+    CHECK(throws_with([&] { common_sample_count(sizes, 0x3u); }, "channel 1 is enabled"));
+    CHECK(throws_with([&] { common_sample_count(sizes, 0x0u); }, "selects no channel"));
+    CHECK(throws_with([&] { common_sample_count(sizes, 0x10001u); }, "above channel 15"));
+
+    std::mt19937 generator(20261125u);
+    std::uniform_int_distribution<uint32_t> mask_draw(1u, 0xffffu);
+    std::uniform_int_distribution<uint32_t> size_draw(1u, 5120u);
+    std::uniform_int_distribution<int> channel_draw(0, 15);
+    for (int trial = 0; trial < 2000; ++trial) {
+        const uint32_t mask = mask_draw(generator);
+        const uint32_t size = size_draw(generator);
+        uint32_t random_sizes[16] = {};
+        for (int channel = 0; channel < 16; ++channel) {
+            random_sizes[channel] = (mask & (1u << channel)) != 0u ? size : size_draw(generator);
+        }
+        CHECK(common_sample_count(random_sizes, mask) == size);
+
+        const int broken = channel_draw(generator);
+        if ((mask & (1u << broken)) != 0u && popcount_u32(mask) > 1) {
+            random_sizes[broken] = size + 1u;
+            CHECK(throws_with([&] { common_sample_count(random_sizes, mask); },
+                              "samples, channel"));
+        }
+    }
+}
+
+void test_sample_count_summary() {
+    SampleCountSummary empty(2500);
+    CHECK(!empty.minimum().has_value() && !empty.maximum().has_value());
+    CHECK(empty.events_shorter_than_record() == 0);
+
+    SampleCountSummary summary(2500);
+    for (uint32_t count : {2500u, 1000u, 2500u, 1500u, 2600u}) {
+        summary.add(count);
+    }
+    CHECK(*summary.minimum() == 1000u);
+    CHECK(*summary.maximum() == 2600u);
+    CHECK(summary.events_shorter_than_record() == 2);
+    CHECK(summary.events_longer_than_record() == 1);
 }
 
 void test_buffers() {
@@ -495,6 +557,34 @@ void test_writer(const fs::path& dir) {
         CHECK(old[0].samples.size() == 2 && old[0].samples[1] == 6);
     }
 
+    // Events of different lengths in one file, as written with overlapping triggers.
+    {
+        const fs::path mixed_run = dir / "writer-mixed";
+        fs::remove_all(mixed_run);
+        fs::create_directories(mixed_run);
+        const uint32_t lengths[] = {8u, 3u, 8u};
+        {
+            WaveformWriter writer(mixed_run, 10);
+            for (uint32_t i = 0; i < 3; ++i) {
+                WaveformEvent mixed;
+                mixed.event_counter = i;
+                mixed.channel_mask = 0x5u;
+                mixed.sample_count = lengths[i];
+                for (uint32_t s = 0; s < 2 * lengths[i]; ++s) {
+                    mixed.samples.push_back(static_cast<int16_t>(100 * i + s));
+                }
+                writer.write_event(mixed);
+            }
+            writer.flush();
+        }
+        const auto back = read_waveform_file(mixed_run / "wf_00000.bin");
+        CHECK(back.size() == 3);
+        CHECK(back[1].sample_count == 3u && back[1].samples.size() == 6u);
+        CHECK(back[1].samples[5] == 105);
+        CHECK(back[2].sample_count == 8u && back[2].samples[0] == 200);
+        CHECK(fs::file_size(mixed_run / "wf_00000.bin") == 3 * 28 + 2 * 2 * (8 + 3 + 8));
+    }
+
     const std::string frame = encode_scope_frame(ev.samples.data(), 4);
     CHECK(frame.size() == 8 + 8);
     CHECK(frame[0] == 'S' && frame[1] == 'C' && frame[2] == 'P' && frame[3] == '1');
@@ -521,6 +611,8 @@ int run_self_test(const std::string& config_path) {
         test_utc_stamp();
         test_buffers();
         test_chunks();
+        test_common_sample_count();
+        test_sample_count_summary();
         test_coincidence();
         test_config(config_path, dir);
         test_bench_keys(dir);

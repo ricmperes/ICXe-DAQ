@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -29,7 +30,53 @@ void write_all(int fd, const char* data, std::size_t n) {
     }
 }
 
+constexpr int kChannelsPerBoard = 16;
+
 }  // namespace
+
+uint32_t common_sample_count(const uint32_t* channel_sizes, uint32_t channel_mask) {
+    if ((channel_mask >> kChannelsPerBoard) != 0u) {
+        throw std::runtime_error("channel mask " + hex32(channel_mask) +
+                                 " has bits above channel 15");
+    }
+    std::optional<uint32_t> common;
+    int first_channel = -1;
+    for (int channel = 0; channel < kChannelsPerBoard; ++channel) {
+        if ((channel_mask & (1u << channel)) == 0u) {
+            continue;
+        }
+        const uint32_t size = channel_sizes[channel];
+        if (size == 0u) {
+            throw std::runtime_error("channel " + std::to_string(channel) +
+                                     " is enabled but the event has no samples for it");
+        }
+        if (!common) {
+            common = size;
+            first_channel = channel;
+        } else if (size != *common) {
+            throw std::runtime_error("channel " + std::to_string(channel) + " has " +
+                                     std::to_string(size) + " samples, channel " +
+                                     std::to_string(first_channel) + " has " +
+                                     std::to_string(*common));
+        }
+    }
+    if (!common) {
+        throw std::runtime_error("channel mask 0x0 selects no channel");
+    }
+    return *common;
+}
+
+SampleCountSummary::SampleCountSummary(uint32_t record_length) : record_length_(record_length) {}
+
+void SampleCountSummary::add(uint32_t sample_count) {
+    if (sample_count < record_length_) {
+        ++events_shorter_;
+    } else if (sample_count > record_length_) {
+        ++events_longer_;
+    }
+    minimum_ = minimum_ ? std::min(*minimum_, sample_count) : sample_count;
+    maximum_ = maximum_ ? std::max(*maximum_, sample_count) : sample_count;
+}
 
 std::string encode_waveform_event(const WaveformEvent& event) {
     const int nch = popcount_u32(event.channel_mask);

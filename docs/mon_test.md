@@ -79,7 +79,7 @@ Fallback that needs no analog sum, for a trigger made only from detectors on one
 
 ## Step 5: overlapping triggers
 
-With a pulser giving two triggers 2 µs apart (inside one 5 µs window), add `{"address": "0x8000", "value": "0x2", "mask": "0x2"}` to `register_writes`. Today's writer requires every event to have the full record length and stops with "event size ... does not match record length" when the board shortens an event. That error alone shows overlap acceptance works. Seeing which samples each event covers needs the writer change planned for the multi-board version.
+Superseded by [overlap_test.md](overlap_test.md), which uses the function generator's burst mode instead of a delay module. The writer now stores events of any length.
 
 ## Results to note
 

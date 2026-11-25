@@ -65,8 +65,10 @@ The absolute time of an event is
 ```text
 trigger_unix_ns = acquisition_start_unix_time_ns + trigger_time_ticks * 8
 waveform_start  = trigger_unix_ns - pre_trigger_samples_actual * 2
-waveform_end    = waveform_start + record_length * 2
+waveform_end    = waveform_start + sample_count * 2
 ```
+
+`sample_count` is the event's own sample count from its header. It equals `record_length` unless the board accepted an overlapping trigger (0x8000 bit[1] = 1), which shortens events. For such events the `waveform_start` rule is provisional until the overlap bench test ([overlap_test.md](overlap_test.md)) shows which samples a shortened event holds.
 
 Differences of `trigger_time_ticks` are exact board time (8 ns, up to the board oscillator accuracy). The absolute offset is only as good as the PC clock, about a millisecond (see Run timestamps).
 
@@ -80,7 +82,7 @@ The event header already carries the mask and the sample count. These metadata f
 | --- | --- | --- |
 | `channel_mask` | `"0x7"` | Hex string of the mask written into each event. |
 | `enabled_channels` | `[0, 1, 2]` | Set bits of that mask, ascending. This is the channel axis. |
-| `record_length` | `1020` | Samples per channel read back from the board. Same value as the header sample count. |
+| `record_length` | `1020` | Samples per channel read back from the board. Equals the header sample count of every full-length event. |
 | `trigger_time_tag_tick_ns` | `8` | Nanoseconds per trigger time tag tick. |
 | `trigger_time_tag_wrap_ticks` | `2147483648` | Wrap period (`2^31` ticks) used to unwrap the tag. |
 | `waveform_format` | `"ICX2"` | Event magic and header layout of this run. |
@@ -89,6 +91,18 @@ The event header already carries the mask and the sample count. These metadata f
 | `files` | `["wf_00000.bin"]` | Names written in this run. |
 | `chunks` | see below | One entry per file, with its time span. |
 | `events_written` | `10` | Events across those files. |
+| `sample_counts` | see below | Smallest and largest header sample count of the run, and how many events were shorter or longer than `record_length`. |
+
+```json
+"sample_counts": {
+  "minimum": 2500,
+  "maximum": 2500,
+  "events_shorter_than_record": 0,
+  "events_longer_than_record": 0
+}
+```
+
+`minimum` and `maximum` are `null` while no event has been written. With overlap acceptance off, all events have `record_length` samples.
 
 `channel_mask` in JSON is a string from `hex32` (`"0x7"`). The header stores the same mask as a binary `uint32`. `record_length_requested` is the config request; the length on disk is `record_length` and the header sample count. `pre_trigger_samples_actual` and `post_trigger_samples_actual` (204 and 816 in the example) locate the trigger inside the full record. Per-channel DAC and baseline fields describe the setup and are separate from the sample packing.
 
@@ -168,7 +182,7 @@ metadata_channel_mask=0x7
 
 `--metadata` prints `enabled_channels` and `channel_mask`. The array is built from the file. `--head N` also prints N samples from event 0, channel axis 0.
 
-`load_waveforms` takes `Nch` and `Ns` from the first event and requires that mask and sample count on every event, with the file length an integer number of those events. `read_waveform_file` in `src/writer.cpp` uses each event's own mask and sample count. The acquisition loop writes one `channel_mask` and one record length for the whole run, which is what the example file is.
+`load_waveforms` takes `Nch` and `Ns` from the first event and requires that mask and sample count on every event, with the file length an integer number of those events. `read_waveform_file` in `src/writer.cpp` uses each event's own mask and sample count. The acquisition loop writes one `channel_mask` for the whole run. The sample count is the record length for every event unless overlapping triggers are accepted; then events in one file can have different lengths, and only `read_waveform_file` (or a reader that walks the headers) handles them, not the fixed-size `load_waveforms` or the numpy dtype below.
 
 `load_waveforms` counts set bits in mask bits 0..15. `encode_waveform_event` sizes the payload with `popcount_u32` of the full 32-bit mask. Channel indexes here are 0..15, and mask `0x7` is 3 channels either way.
 

@@ -231,6 +231,16 @@ struct Accum {
     }
 };
 
+json sample_counts_json(const SampleCountSummary& summary) {
+    const auto optional_count = [](std::optional<uint32_t> value) {
+        return value ? json(*value) : json(nullptr);
+    };
+    return json{{"minimum", optional_count(summary.minimum())},
+                {"maximum", optional_count(summary.maximum())},
+                {"events_shorter_than_record", summary.events_shorter_than_record()},
+                {"events_longer_than_record", summary.events_longer_than_record()}};
+}
+
 json chunks_json(const ChunkTracker& tracker) {
     json out = json::array();
     for (const ChunkInfo& c : tracker.chunks()) {
@@ -741,12 +751,14 @@ public:
         // The trigger time tag counts from this start. acq_start_ns_ is taken
         // just before SWStartAcquisition, after started.
         TimeTagUnwrapper unwrapper(acq_start_ns_);
-        ChunkTracker chunks(started.unix_ns, acq_start_ns_, pre_actual_, record_read_);
+        ChunkTracker chunks(started.unix_ns, acq_start_ns_, pre_actual_);
+        SampleCountSummary sample_counts(record_read_);
         meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
         const auto update_files = [&] {
             meta["events_written"] = writer.events_written();
             meta["files"] = writer.filenames();
             meta["chunks"] = chunks_json(chunks);
+            meta["sample_counts"] = sample_counts_json(sample_counts);
         };
 
         timespec next_trigger = start;
@@ -781,11 +793,13 @@ public:
                     event.trigger_time_tag = info.TriggerTimeTag;
                     event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
                     event.channel_mask = cfg_.channel_mask;
-                    event.sample_count = record_read_;
-                    event.samples = extract_enabled(ev, record_read_);
+                    event.sample_count = common_sample_count(ev->ChSize, cfg_.channel_mask);
+                    event.samples = extract_enabled(ev, event.sample_count);
                     writer.write_event(event);
                     chunks.add_event(writer.file_index(), writer.filenames().back(),
-                                     event.event_counter, event.trigger_time_ticks);
+                                     event.event_counter, event.trigger_time_ticks,
+                                     event.sample_count);
+                    sample_counts.add(event.sample_count);
                     return !(max_events > 0 && writer.events_written() >= max_events);
                 });
                 if (max_events > 0 && writer.events_written() >= max_events) {
