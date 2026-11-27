@@ -802,6 +802,7 @@ RunConfig load_config(const std::string& path) {
     run.protected_serials = parse_protected_serials(j);
     for (const json& board : j.at("boards")) {
         run.boards.push_back(parse_board_entry(j, board));
+        run.boards.back().protected_serials = run.protected_serials;
     }
     check_boards_together(run);
     return run;

@@ -78,6 +78,8 @@ struct ConnectionConfig {
 struct Config {
     std::string board_name;
     uint32_t expected_serial = 0;
+    // Copy of the file's protected_serials, so the opened board can be checked.
+    std::vector<uint32_t> protected_serials;
     ClockSource clock_source = ClockSource::Internal;
     std::string name = "run";
     std::string output_directory = "data";

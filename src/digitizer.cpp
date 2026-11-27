@@ -1,5 +1,6 @@
 #include "digitizer.hpp"
 
+#include "board_status.hpp"
 #include "chunks.hpp"
 #include "util.hpp"
 #include "writer.hpp"
@@ -241,6 +242,45 @@ json sample_counts_json(const SampleCountSummary& summary) {
                 {"events_longer_than_record", summary.events_longer_than_record()}};
 }
 
+json acquisition_status_json(const AcquisitionStatus& status) {
+    return {{"raw", hex32(status.raw)},
+            {"is_running", status.is_running},
+            {"is_memory_full", status.is_memory_full},
+            {"is_clock_external", status.is_clock_external},
+            {"is_pll_lock_kept", status.is_pll_lock_kept},
+            {"is_board_ready", status.is_board_ready},
+            {"are_channels_shut_down", status.are_channels_shut_down},
+            {"overheated_channels", overheated_channels_text(status.overheated_mezzanines)}};
+}
+
+json board_failure_json(const BoardFailureStatus& failure) {
+    return {{"raw", hex32(failure.raw)},
+            {"has_pll_lock_loss", failure.has_pll_lock_loss},
+            {"has_temperature_failure", failure.has_temperature_failure},
+            {"has_adc_power_down", failure.has_adc_power_down}};
+}
+
+// Board state at one moment: status, failure register and ADC temperatures.
+struct BoardHealth {
+    AcquisitionStatus status;
+    BoardFailureStatus failure;
+    std::vector<int> adc_temperatures_celsius;
+};
+
+json board_health_json(const BoardHealth& health) {
+    return {{"acquisition_status_0x8104", acquisition_status_json(health.status)},
+            {"board_failure_status_0x8178", board_failure_json(health.failure)},
+            {"adc_temperatures_celsius", health.adc_temperatures_celsius}};
+}
+
+std::string temperature_range_text(const std::vector<int>& temperatures) {
+    if (temperatures.empty()) {
+        return "unread";
+    }
+    const auto [low, high] = std::minmax_element(temperatures.begin(), temperatures.end());
+    return std::to_string(*low) + ".." + std::to_string(*high) + " °C";
+}
+
 json chunks_json(const ChunkTracker& tracker) {
     json out = json::array();
     for (const ChunkInfo& c : tracker.chunks()) {
@@ -379,6 +419,60 @@ public:
                      cfg_.connection.use_vme_base_address ? "true" : "false");
         std::fprintf(out, "open_base: %s\n", hex32(open_base_address(cfg_.connection)).c_str());
         std::fflush(out);
+    }
+
+    // Stops before any write when the opened board is not the configured one.
+    void verify_identity() const {
+        const BoardIdentity identity{cfg_.board_name, board_.serial, board_.roc_fw, board_.amc_fw};
+        const std::optional<std::string> problem =
+            identity_problem(identity, cfg_.expected_serial, cfg_.protected_serials);
+        if (problem) {
+            throw std::runtime_error(*problem);
+        }
+    }
+
+    // Read-only status report for the info command.
+    void print_health(FILE* out) {
+        const BoardHealth health = read_health();
+        std::fprintf(out, "status_0x8104: %s\n", hex32(health.status.raw).c_str());
+        std::fprintf(out, "clock_source: %s\n",
+                     health.status.is_clock_external ? "external" : "internal");
+        std::fprintf(out, "pll_lock_kept: %s\n", health.status.is_pll_lock_kept ? "yes" : "no");
+        std::fprintf(out, "board_ready: %s\n", health.status.is_board_ready ? "yes" : "no");
+        std::fprintf(out, "channels_shut_down: %s\n",
+                     health.status.are_channels_shut_down ? "yes" : "no");
+        std::fprintf(out, "board_failure_0x8178: %s\n", hex32(health.failure.raw).c_str());
+        std::fprintf(out, "adc_temperatures_celsius:");
+        for (const int temperature : health.adc_temperatures_celsius) {
+            std::fprintf(out, " %d", temperature);
+        }
+        std::fprintf(out, "\n");
+        for (const std::string& problem :
+             status_problems(health.status, {cfg_.clock_source, false, false})) {
+            std::fprintf(out, "status_problem: %s\n", problem.c_str());
+        }
+        std::fflush(out);
+    }
+
+    // Before the first write: a wrong clock or channels in shutdown cannot be fixed by
+    // programming the board.
+    void check_status_before_writing() {
+        require_status(read_fresh_status(), {cfg_.clock_source, false, false},
+                       "before programming");
+    }
+
+    // After programming and baseline, just before the acquisition starts. Also
+    // records the board health for the metadata.
+    void check_status_before_start() {
+        health_start_ = read_health();
+        health_start_->status = read_fresh_status();
+        require_status(health_start_->status, {cfg_.clock_source, true, false}, "before start");
+        std::fprintf(stderr,
+                     "status: %s 0x8104=%s clock %s, ready; 0x8178=%s; ADC temperatures %s\n",
+                     cfg_.board_name.c_str(), hex32(health_start_->status.raw).c_str(),
+                     to_string(cfg_.clock_source), hex32(health_start_->failure.raw).c_str(),
+                     temperature_range_text(health_start_->adc_temperatures_celsius).c_str());
+        std::fflush(stderr);
     }
 
     // Bench access for the reg command: no reset, no programming.
@@ -811,7 +905,15 @@ public:
                     break;
                 }
                 const bool file_changed = writer.file_index() != last_file;
-                if (file_changed || elapsed_s(mono_now(), last_status) >= 1.0) {
+                const bool is_status_due = elapsed_s(mono_now(), last_status) >= 1.0;
+                if (is_status_due) {
+                    status_problems_ = check_status_during_run();
+                    if (!status_problems_.empty()) {
+                        stop = "board_status";
+                        break;
+                    }
+                }
+                if (file_changed || is_status_due) {
                     writer.flush();
                     update_files();
                     write_metadata(run_dir / "metadata.json", meta);
@@ -859,11 +961,17 @@ public:
         meta["ended_utc"] = ended.iso;
         meta["ended_utc_unix_time_ns"] = ended.unix_ns;
         meta["stop_reason"] = stop;
+        meta["board_health"]["end"] = read_health_json_or_null();
+        meta["board_health"]["status_checks_during_run"] = status_checks_during_run_;
+        meta["board_health"]["problems"] = status_problems_;
         write_metadata(run_dir / "metadata.json", meta);
         std::fprintf(stdout, "events=%llu file=%d stop=%s\n",
                      static_cast<unsigned long long>(writer.events_written()), writer.file_index(),
                      stop.c_str());
         std::fflush(stdout);
+        if (!status_problems_.empty()) {
+            throw std::runtime_error(status_problem_message("during the run"));
+        }
         if (writer.events_written() > 0) {
             prove_coincidence_after_stop();
         }
@@ -894,10 +1002,20 @@ public:
         const bool rate = cfg_.trigger == TriggerType::Rate;
         const int64_t period_ns = rate ? std::llround(1e9 / cfg_.rate_hz) : 0;
 
+        timespec last_status = start;
         while (!g_stop_signal) {
             const timespec now = mono_now();
             if (cfg_.duration_s > 0.0 && elapsed_s(now, start) >= cfg_.duration_s) {
                 break;
+            }
+            if (elapsed_s(now, last_status) >= 1.0) {
+                status_problems_ = check_status_during_run();
+                if (!status_problems_.empty()) {
+                    CAEN_DGTZ_SWStopAcquisition(handle_);
+                    acq_on_ = false;
+                    throw std::runtime_error(status_problem_message("during scope"));
+                }
+                last_status = now;
             }
             if (rate && ts_ge(now, next_trigger)) {
                 check(CAEN_DGTZ_SendSWtrigger(handle_), "SendSWtrigger");
@@ -947,6 +1065,66 @@ public:
     }
 
 private:
+    AcquisitionStatus read_status() {
+        uint32_t raw = 0;
+        check(CAEN_DGTZ_ReadRegister(handle_, 0x8104, &raw), "read status 0x8104");
+        return decode_acquisition_status(raw);
+    }
+
+    // Reading 0x8104 clears its PLL-unlock flag (bit 7), so the first read can show an
+    // unlock from before (e.g. power on); the second read shows the current state.
+    AcquisitionStatus read_fresh_status() {
+        read_status();
+        return read_status();
+    }
+
+    BoardHealth read_health() {
+        BoardHealth health;
+        health.status = read_status();
+        uint32_t failure = 0;
+        check(CAEN_DGTZ_ReadRegister(handle_, 0x8178, &failure), "read board failure 0x8178");
+        health.failure = decode_board_failure_status(failure);
+        for (uint32_t ch = 0; ch < board_.channels; ++ch) {
+            uint32_t raw = 0;
+            check(CAEN_DGTZ_ReadRegister(handle_, 0x10A8u | (ch << 8), &raw),
+                  "read ADC temperature 0x1nA8");
+            health.adc_temperatures_celsius.push_back(decode_adc_temperature(raw));
+        }
+        return health;
+    }
+
+    json read_health_json_or_null() {
+        try {
+            return board_health_json(read_health());
+        } catch (const std::exception& err) {
+            std::fprintf(stderr, "board health at the end not read: %s\n", err.what());
+            return nullptr;
+        }
+    }
+
+    std::vector<std::string> check_status_during_run() {
+        ++status_checks_during_run_;
+        const AcquisitionStatus status = read_status();
+        return status_problems(status, {cfg_.clock_source, false, is_running_bit_reliable_});
+    }
+
+    std::string status_problem_message(const std::string& when) const {
+        std::string message = cfg_.board_name + " " + when + ":";
+        for (const std::string& problem : status_problems_) {
+            message += "\n  " + problem;
+        }
+        return message;
+    }
+
+    void require_status(const AcquisitionStatus& status, const StatusExpectation& expectation,
+                        const std::string& when) {
+        status_problems_ = status_problems(status, expectation);
+        if (!status_problems_.empty()) {
+            throw std::runtime_error(status_problem_message(when + " (0x8104=" +
+                                                            hex32(status.raw) + ")"));
+        }
+    }
+
     uint32_t wait_status_after_reset(CAEN_DGTZ_ErrorCode reset_err, uint32_t status_before) {
         const timespec start = mono_now();
         uint32_t status = 0;
@@ -988,6 +1166,7 @@ private:
         // PC time is taken before, so it is a lower bound for that reset.
         acq_start_ns_ = unix_now_ns();
         const CAEN_DGTZ_ErrorCode err = CAEN_DGTZ_SWStartAcquisition(handle_);
+        is_running_bit_reliable_ = err == CAEN_DGTZ_Success;
         if (err != CAEN_DGTZ_Success) {
             uint32_t status = 0;
             uint32_t control_after = 0;
@@ -1698,6 +1877,13 @@ private:
         meta["chunks"] = json::array();
         meta["stop_reason"] = nullptr;
         meta["waveforms_per_file"] = cfg_.waveforms_per_file;
+        meta["board_health"] = {
+            {"start", health_start_ ? board_health_json(*health_start_) : json(nullptr)},
+            {"end", nullptr},
+            {"status_checks_during_run", 0},
+            {"problems", json::array()},
+            {"note", "start: just before the acquisition starts; end: after it stopped. "
+                     "0x8104 is checked once per second during the run."}};
         return meta;
     }
 
@@ -1748,6 +1934,10 @@ private:
     std::vector<RegisterAccess> monitor_access_;
     std::vector<RegisterAccess> raw_access_;
     RegisterAccess overlap_access_;
+    std::optional<BoardHealth> health_start_;
+    std::vector<std::string> status_problems_;
+    uint64_t status_checks_during_run_ = 0;
+    bool is_running_bit_reliable_ = true;
     std::unique_ptr<ReadoutBuffer> readout_;
 };
 
@@ -1756,22 +1946,28 @@ private:
 void command_info(const Config& cfg) {
     Session session(cfg);
     session.print_info(stdout);
+    session.verify_identity();
     session.check_target();
+    session.print_health(stdout);
 }
 
 void command_run(const Config& cfg, const std::string& config_path, uint64_t max_events) {
     install_stop_signals();
     Session session(cfg);
     session.print_info(stderr);
+    session.verify_identity();
     session.check_target();
+    session.check_status_before_writing();
     session.program();
     session.baseline_if_needed();
     session.arm_trigger();
+    session.check_status_before_start();
     session.acquire_run(config_path, max_events);
 }
 
 void command_reg(const Config& cfg, uint32_t address, std::optional<uint32_t> value) {
     Session session(cfg);
+    session.verify_identity();
     session.check_target();
     const RegisterAccess a = session.register_command(address, value);
     if (a.wrote) {
@@ -1793,9 +1989,12 @@ void command_scope(const Config& cfg, int channel) {
     install_stop_signals();
     Session session(cfg);
     session.print_info(stderr);
+    session.verify_identity();
     session.check_target();
+    session.check_status_before_writing();
     session.program();
     session.baseline_if_needed();
     session.arm_trigger();
+    session.check_status_before_start();
     session.acquire_scope(channel);
 }

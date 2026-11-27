@@ -1,5 +1,6 @@
 #include "self_test.hpp"
 
+#include "board_status.hpp"
 #include "buffers.hpp"
 #include "chunks.hpp"
 #include "coincidence.hpp"
@@ -747,6 +748,113 @@ void test_bench_keys(const fs::path& dir) {
         "multiple of 4"));
 }
 
+bool has_problem_with(const std::vector<std::string>& problems, const std::string& fragment) {
+    return std::any_of(problems.begin(), problems.end(), [&](const std::string& problem) {
+        return problem.find(fragment) != std::string::npos;
+    });
+}
+
+void test_board_status() {
+    // Values read on the bench in step 2b.
+    const AcquisitionStatus master = decode_acquisition_status(0x180u);
+    CHECK(!master.is_clock_external && master.is_pll_lock_kept && master.is_board_ready);
+    CHECK(!master.is_running && !master.are_channels_shut_down);
+    CHECK(status_problems(master, {ClockSource::Internal, true, false}).empty());
+    const std::vector<std::string> master_as_slave =
+        status_problems(master, {ClockSource::External, false, false});
+    CHECK(master_as_slave.size() == 1 &&
+          has_problem_with(master_as_slave, "clock source is internal"));
+
+    const AcquisitionStatus slave = decode_acquisition_status(0x1A0u);
+    CHECK(slave.is_clock_external && slave.is_pll_lock_kept && slave.is_board_ready);
+    CHECK(status_problems(slave, {ClockSource::External, true, false}).empty());
+
+    const AcquisitionStatus b3 = decode_acquisition_status(0x801A0u);
+    CHECK(b3.are_channels_shut_down && b3.overheated_mezzanines == 0u);
+    const std::vector<std::string> b3_problems =
+        status_problems(b3, {ClockSource::External, false, false});
+    CHECK(b3_problems.size() == 1 && has_problem_with(b3_problems, "shutdown"));
+
+    const AcquisitionStatus hot = decode_acquisition_status(0xA801A4u);
+    CHECK(hot.is_running && hot.overheated_mezzanines == 0xAu);
+    CHECK(overheated_channels_text(hot.overheated_mezzanines) == "channels 4-7, 12-15");
+    CHECK(has_problem_with(status_problems(hot, {ClockSource::External, false, true}),
+                           "over-temperature on channels 4-7, 12-15"));
+    CHECK(has_problem_with(status_problems(decode_acquisition_status(0x120u),
+                                           {ClockSource::External, false, false}),
+                           "PLL lost its lock"));
+    CHECK(has_problem_with(status_problems(decode_acquisition_status(0xA0u),
+                                           {ClockSource::External, true, false}),
+                           "not ready"));
+    CHECK(has_problem_with(status_problems(decode_acquisition_status(0x1A0u),
+                                           {ClockSource::External, false, true}),
+                           "stopped its acquisition"));
+    CHECK(status_problems(decode_acquisition_status(0x1A4u), {ClockSource::External, true, true})
+              .empty());
+
+    const BoardFailureStatus failure = decode_board_failure_status(0x70u);
+    CHECK(failure.has_pll_lock_loss && failure.has_temperature_failure &&
+          failure.has_adc_power_down);
+    CHECK(!decode_board_failure_status(0x0u).has_temperature_failure);
+
+    CHECK(decode_adc_temperature(0x2Du) == 45);
+    CHECK(decode_adc_temperature(0xC0u) == -64);
+    CHECK(decode_adc_temperature(0x7Fu) == 127);
+    CHECK(decode_adc_temperature(0xFFFFFF2Du) == 45);
+
+    const std::vector<uint32_t> protected_serials = {30176};
+    CHECK(!identity_problem({"B1", 30165, "04.29", "00.05"}, 30165, protected_serials));
+    const auto wrong = identity_problem({"B2", 30167, "04.29", "00.05"}, 30166, protected_serials);
+    CHECK(wrong && wrong->find("reports serial 30167, the config expects 30166") !=
+                       std::string::npos);
+    const auto other_team =
+        identity_problem({"B4", 30176, "04.29", "00.05"}, 30176, protected_serials);
+    CHECK(other_team && other_team->find("protected_serials") != std::string::npos);
+
+    std::vector<BoardIdentity> boards = {{"B1", 30165, "04.29 - Build 8716", "00.05 - Build 9130"},
+                                         {"B2", 30166, "04.29 - Build 8716", "00.05 - Build 9130"}};
+    CHECK(!firmware_mismatch(boards));
+    CHECK(!firmware_mismatch({}));
+    boards.push_back({"B3", 30167, "04.29 - Build 8716", "00.05 - Build 9000"});
+    const auto mismatch = firmware_mismatch(boards);
+    CHECK(mismatch && mismatch->find("B3") != std::string::npos);
+
+    // Random register values: every decoded flag equals its bit, and each problem appears
+    // exactly when its condition holds.
+    std::mt19937 generator(20261127u);
+    std::uniform_int_distribution<uint32_t> any_value;
+    for (int trial = 0; trial < 5000; ++trial) {
+        const uint32_t raw = any_value(generator);
+        const AcquisitionStatus status = decode_acquisition_status(raw);
+        CHECK(status.raw == raw);
+        CHECK(status.is_running == (((raw >> 2) & 1u) != 0u));
+        CHECK(status.is_memory_full == (((raw >> 4) & 1u) != 0u));
+        CHECK(status.is_clock_external == (((raw >> 5) & 1u) != 0u));
+        CHECK(status.is_pll_lock_kept == (((raw >> 7) & 1u) != 0u));
+        CHECK(status.is_board_ready == (((raw >> 8) & 1u) != 0u));
+        CHECK(status.are_channels_shut_down == (((raw >> 19) & 1u) != 0u));
+        CHECK(status.overheated_mezzanines == ((raw >> 20) & 0xfu));
+        const StatusExpectation expectation{
+            (trial % 2) == 0 ? ClockSource::Internal : ClockSource::External, (trial % 3) == 0,
+            (trial % 5) == 0};
+        const std::vector<std::string> problems = status_problems(status, expectation);
+        const bool wants_external = expectation.clock_source == ClockSource::External;
+        const std::size_t expected_count =
+            (status.overheated_mezzanines != 0u ? 1u : 0u) +
+            (status.are_channels_shut_down ? 1u : 0u) +
+            (status.is_clock_external != wants_external ? 1u : 0u) +
+            (!status.is_pll_lock_kept ? 1u : 0u) +
+            (expectation.requires_board_ready && !status.is_board_ready ? 1u : 0u) +
+            (expectation.requires_running && !status.is_running ? 1u : 0u);
+        CHECK(problems.size() == expected_count);
+        CHECK(has_problem_with(problems, "clock source") ==
+              (status.is_clock_external != wants_external));
+        const int temperature = decode_adc_temperature(raw);
+        CHECK(temperature >= -128 && temperature <= 127);
+        CHECK((static_cast<uint32_t>(temperature) & 0xffu) == (raw & 0xffu));
+    }
+}
+
 void test_writer(const fs::path& dir) {
     const fs::path run = dir / "writer";
     fs::remove_all(run);
@@ -884,6 +992,7 @@ int run_self_test(const std::string& config_path) {
         test_chunks();
         test_common_sample_count();
         test_sample_count_summary();
+        test_board_status();
         test_coincidence();
         test_config(dir);
         test_every_key_required(dir);
