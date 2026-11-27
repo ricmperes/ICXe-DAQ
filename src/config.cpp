@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -142,7 +143,20 @@ Config with_duration_option(Config cfg, std::optional<double> duration_s) {
     return cfg;
 }
 
+std::optional<std::string> detector_of(const std::vector<DetectorRange>& channel_map,
+                                       int global_channel) {
+    for (const DetectorRange& range : channel_map) {
+        if (global_channel >= range.first && global_channel <= range.last) {
+            return range.detector;
+        }
+    }
+    return std::nullopt;
+}
+
 namespace {
+
+// strax stores the channel as int16.
+constexpr int kMaxGlobalChannel = 32767;
 
 json read_json_file(const std::string& path) {
     std::ifstream in(path);
@@ -335,8 +349,9 @@ const std::set<std::string> kAnalogMonitorKeys = {"mode", "level_volts"};
 const std::set<std::string> kRegisterWriteKeys = {"address", "value", "mask"};
 const std::set<std::string> kCoincidenceKeys = {"majority", "window_ns", "pairs"};
 const std::set<std::string> kPairKeys = {"channels", "logic"};
-const std::set<std::string> kChannelKeys = {"index",          "enabled",   "polarity",
-                                            "target_percent", "threshold", "dynamic_range"};
+const std::set<std::string> kChannelKeys = {"index",          "global_channel", "enabled",
+                                            "polarity",       "target_percent", "threshold",
+                                            "dynamic_range"};
 const std::set<std::string> kBaselineKeys = {"apply_on_start", "tolerance_lsb", "max_iterations",
                                              "triggers_per_step"};
 const std::set<std::string> kTriggerKeys = {"type", "io_level", "rate_hz", "coincidence"};
@@ -451,6 +466,55 @@ bool valid_run_name(const std::string& s) {
     return true;
 }
 
+std::vector<std::string> parse_text_list(const json& j, const char* key) {
+    const json& list = require_key(j, key);
+    if (!list.is_array()) {
+        throw std::runtime_error(std::string(key) + " must be a list of strings ([] for none)");
+    }
+    std::vector<std::string> texts;
+    for (const json& entry : list) {
+        if (!entry.is_string() || entry.get<std::string>().empty()) {
+            throw std::runtime_error(std::string(key) + " entries must be non-empty strings");
+        }
+        texts.push_back(entry.get<std::string>());
+    }
+    return texts;
+}
+
+std::vector<DetectorRange> parse_channel_map(const json& map) {
+    if (!map.is_object() || map.empty()) {
+        throw std::runtime_error(
+            "channel_map must be an object of detector: [first, last], e.g. {\"tpc\": [0, 99]}");
+    }
+    std::vector<DetectorRange> ranges;
+    for (const auto& [detector, range] : map.items()) {
+        if (!valid_run_name(detector)) {
+            throw std::runtime_error("channel_map detector \"" + detector +
+                                     "\" must be 1..64 characters of letters, digits, '-' or '_'");
+        }
+        const bool is_pair = range.is_array() && range.size() == 2u &&
+                             range[0].is_number_integer() && range[1].is_number_integer();
+        if (!is_pair) {
+            throw std::runtime_error("channel_map." + detector +
+                                     " must be [first, last], two integers");
+        }
+        DetectorRange entry{detector, range[0].get<int>(), range[1].get<int>()};
+        if (entry.first < 0 || entry.last > kMaxGlobalChannel || entry.first > entry.last) {
+            throw std::runtime_error("channel_map." + detector +
+                                     " must have 0 <= first <= last <= " +
+                                     std::to_string(kMaxGlobalChannel));
+        }
+        for (const DetectorRange& other : ranges) {
+            if (entry.first <= other.last && other.first <= entry.last) {
+                throw std::runtime_error("channel_map ranges " + other.detector + " and " +
+                                         detector + " overlap");
+            }
+        }
+        ranges.push_back(entry);
+    }
+    return ranges;
+}
+
 CoincidenceProgram parse_coincidence(const json& j, uint32_t enabled_mask) {
     reject_unknown_keys(j, kCoincidenceKeys, "coincidence");
     if (!j.contains("pairs") || !j.at("pairs").is_array()) {
@@ -493,6 +557,11 @@ ChannelConfig parse_channel(const json& cj) {
     const std::string label = "channel " + std::to_string(ch.index);
     try {
         require_keys(cj, kChannelKeys, label);
+        ch.global_channel = require_int(cj, "global_channel");
+        if (ch.global_channel < 0 || ch.global_channel > kMaxGlobalChannel) {
+            throw std::runtime_error("global_channel must be 0.." +
+                                     std::to_string(kMaxGlobalChannel));
+        }
         ch.enabled = require_bool(cj, "enabled");
         ch.polarity = parse_polarity(require_string(cj, "polarity"));
         ch.target_percent = require_number(cj, "target_percent");
@@ -519,10 +588,19 @@ ChannelConfig parse_channel(const json& cj) {
 Config parse_board(const json& j) {
     Config cfg;
 
-    cfg.name = require_string(j, "name");
-    if (!valid_run_name(cfg.name)) {
-        throw std::runtime_error("name must be 1..64 characters of letters, digits, '-' or '_'");
+    cfg.run_mode = require_string(j, "run_mode");
+    if (!valid_run_name(cfg.run_mode)) {
+        throw std::runtime_error(
+            "run_mode must be 1..64 characters of letters, digits, '-' or '_'");
     }
+    cfg.tags = parse_text_list(j, "tags");
+    for (const std::string& tag : cfg.tags) {
+        if (tag.find(',') != std::string::npos) {
+            throw std::runtime_error("tag \"" + tag +
+                                     "\" contains a comma (select_runs splits tags at commas)");
+        }
+    }
+    cfg.comments = parse_text_list(j, "comments");
     cfg.output_directory = require_string(j, "output_directory");
     if (cfg.output_directory.empty()) {
         throw std::runtime_error("output_directory is empty");
@@ -531,11 +609,14 @@ Config parse_board(const json& j) {
     if (cfg.duration_s < 0) {
         throw std::runtime_error("duration_s must be >= 0");
     }
-    const int files = require_int(j, "waveforms_per_file");
-    if (files < 1) {
-        throw std::runtime_error("waveforms_per_file must be >= 1");
+    cfg.chunk_duration_s = require_number(j, "chunk_duration_s");
+    if (!(cfg.chunk_duration_s > 0.0)) {
+        throw std::runtime_error("chunk_duration_s must be > 0");
     }
-    cfg.waveforms_per_file = static_cast<uint32_t>(files);
+    cfg.chunk_max_mb = require_number(j, "chunk_max_mb");
+    if (!(cfg.chunk_max_mb >= 1.0)) {
+        throw std::runtime_error("chunk_max_mb must be >= 1");
+    }
     const int blt = require_int(j, "max_events_blt");
     if (blt < 1 || blt > 1024) {
         throw std::runtime_error("max_events_blt must be 1..1024");
@@ -649,10 +730,14 @@ Config parse_board(const json& j) {
     return cfg;
 }
 
-const std::set<std::string> kSharedKeys = {"name",
+const std::set<std::string> kSharedKeys = {"run_mode",
+                                           "tags",
+                                           "comments",
+                                           "channel_map",
                                            "output_directory",
                                            "duration_s",
-                                           "waveforms_per_file",
+                                           "chunk_duration_s",
+                                           "chunk_max_mb",
                                            "record_length",
                                            "pre_trigger_samples",
                                            "n_buffers",
@@ -710,6 +795,7 @@ json merge_board(const json& shared, const json& board) {
     json merged = shared;
     merged.erase("boards");
     merged.erase("protected_serials");
+    merged.erase("channel_map");
     merged["connection"]["vme_base_address"] = board.at("vme_base_address");
     merged["channels"] = board.at("channels");
     merged["trigger"]["coincidence"] = board.at("coincidence");
@@ -791,6 +877,19 @@ void check_boards_together(const RunConfig& run) {
             ++internal_clocks;
         }
     }
+    std::map<int, std::string> owners;
+    for (const Config& board : run.boards) {
+        for (const ChannelConfig& channel : board.channels) {
+            const std::string owner =
+                board.board_name + " channel " + std::to_string(channel.index);
+            const auto [existing, is_new] = owners.emplace(channel.global_channel, owner);
+            if (!is_new) {
+                throw std::runtime_error("global_channel " +
+                                         std::to_string(channel.global_channel) + " is used by " +
+                                         existing->second + " and " + owner);
+            }
+        }
+    }
     if (run.boards.size() > 1u) {
         if (!run.boards.front().connection.use_vme_base_address) {
             throw std::runtime_error(
@@ -830,9 +929,23 @@ RunConfig load_config(const std::string& path) {
     }
     RunConfig run;
     run.protected_serials = parse_protected_serials(j);
+    run.channel_map = parse_channel_map(require_key(j, "channel_map"));
     for (const json& board : j.at("boards")) {
         run.boards.push_back(parse_board_entry(j, board));
-        run.boards.back().protected_serials = run.protected_serials;
+        Config& cfg = run.boards.back();
+        cfg.protected_serials = run.protected_serials;
+        cfg.channel_map = run.channel_map;
+        for (ChannelConfig& channel : cfg.channels) {
+            const std::optional<std::string> detector =
+                detector_of(run.channel_map, channel.global_channel);
+            if (!detector) {
+                throw std::runtime_error("board " + cfg.board_name + " channel " +
+                                         std::to_string(channel.index) + ": global_channel " +
+                                         std::to_string(channel.global_channel) +
+                                         " is in no range of channel_map");
+            }
+            channel.detector = *detector;
+        }
     }
     check_boards_together(run);
     return run;

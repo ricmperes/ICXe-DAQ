@@ -47,6 +47,8 @@ private:
 // 28-byte header (magic ICX2, counter, raw time tag, mask, sample count,
 // uint64 unwrapped time tag) then samples. The reader also accepts 20-byte ICX1.
 std::string encode_waveform_event(const WaveformEvent& event);
+// Size of encode_waveform_event(event) in bytes.
+uint64_t encoded_event_bytes(const WaveformEvent& event);
 std::vector<WaveformEvent> read_waveform_file(const std::filesystem::path& path);
 
 // magic SCP1, uint32 n_samples, int16 samples. No run files.
@@ -54,27 +56,29 @@ std::string encode_scope_frame(const int16_t* samples, uint32_t n_samples);
 
 class WaveformWriter {
 public:
-    WaveformWriter(std::filesystem::path run_dir, uint32_t waveforms_per_file);
+    explicit WaveformWriter(std::filesystem::path run_dir);
     ~WaveformWriter();
 
     WaveformWriter(const WaveformWriter&) = delete;
     WaveformWriter& operator=(const WaveformWriter&) = delete;
 
-    void write_event(const WaveformEvent& event);
+    // begins_new_file: close the current file and write the event into the next one
+    // (the first event always opens wf_00000.bin).
+    void write_event(const WaveformEvent& event, bool begins_new_file);
     void flush();
 
     uint64_t events_written() const { return events_written_; }
     int file_index() const { return events_written_ == 0 ? 0 : current_index_; }
     const std::vector<std::string>& filenames() const { return filenames_; }
+    uint64_t bytes_in_file() const { return bytes_in_file_; }
 
 private:
     void open_next();
 
     std::filesystem::path run_dir_;
-    uint32_t per_file_;
     std::filesystem::path current_path_;
     int current_index_ = -1;
-    uint32_t in_file_ = 0;
+    uint64_t bytes_in_file_ = 0;
     uint64_t events_written_ = 0;
     std::vector<std::string> filenames_;
     int fd_ = -1;

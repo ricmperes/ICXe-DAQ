@@ -837,7 +837,8 @@ public:
     void acquire_run(const std::string& config_path, uint64_t max_events) {
         const fs::path run_dir = make_run_dir();
         fs::copy_file(config_path, run_dir / "config.json", fs::copy_options::overwrite_existing);
-        WaveformWriter writer(run_dir, cfg_.waveforms_per_file);
+        WaveformWriter writer(run_dir);
+        const ChunkLimits limits = chunk_limits(cfg_.chunk_duration_s, cfg_.chunk_max_mb);
         const UtcStamp started = utc_now_stamp();
         std::string stop = "error";
         json meta = make_metadata(started);
@@ -886,7 +887,13 @@ public:
             event.channel_mask = cfg_.channel_mask;
             event.sample_count = common_sample_count(ev->ChSize, cfg_.channel_mask);
             event.samples = extract_enabled(ev, event.sample_count);
-            writer.write_event(event);
+            const bool begins_new_file =
+                !chunks.chunks().empty() &&
+                is_chunk_full(limits, chunks.chunks().back().first_waveform_start_ns,
+                              chunks.waveform_start_ns(event.trigger_time_ticks,
+                                                       event.sample_count),
+                              writer.bytes_in_file(), encoded_event_bytes(event));
+            writer.write_event(event, begins_new_file);
             chunks.add_event(writer.file_index(), writer.filenames().back(),
                              event.event_counter, event.trigger_time_ticks,
                              event.sample_count);
@@ -1764,19 +1771,36 @@ private:
     fs::path make_run_dir() const {
         fs::create_directories(cfg_.output_directory);
         const std::string stamp = utc_now_compact();
-        fs::path dir = fs::path(cfg_.output_directory) / (cfg_.name + "_" + stamp);
+        fs::path dir = fs::path(cfg_.output_directory) / (cfg_.run_mode + "_" + stamp);
         int n = 2;
         while (fs::exists(dir)) {
             dir = fs::path(cfg_.output_directory) /
-                  (cfg_.name + "_" + stamp + "-" + std::to_string(n));
+                  (cfg_.run_mode + "_" + stamp + "-" + std::to_string(n));
             ++n;
         }
         fs::create_directories(dir);
         return dir;
     }
 
+    const ChannelConfig& channel_config_of(int index) const {
+        for (const ChannelConfig& channel : cfg_.channels) {
+            if (channel.index == index) {
+                return channel;
+            }
+        }
+        throw std::runtime_error("channel " + std::to_string(index) + " is not in the config");
+    }
+
     json make_metadata(const UtcStamp& started) const {
         json meta;
+        meta["run_mode"] = cfg_.run_mode;
+        meta["tags"] = cfg_.tags;
+        meta["comments"] = cfg_.comments;
+        json channel_map = json::object();
+        for (const DetectorRange& range : cfg_.channel_map) {
+            channel_map[range.detector] = {range.first, range.last};
+        }
+        meta["channel_map"] = channel_map;
         meta["board"] = {
             {"model", board_.model_name},
             {"model_code", board_.model},
@@ -1916,7 +1940,10 @@ private:
 
         json channels = json::array();
         for (const ChannelResult& result : results_) {
+            const ChannelConfig& channel_config = channel_config_of(result.index);
             json cj = {{"index", result.index},
+                       {"global_channel", channel_config.global_channel},
+                       {"detector", channel_config.detector},
                        {"enabled", result.enabled},
                        {"polarity", to_string(result.polarity)},
                        {"dynamic_range", to_string(result.range)},
@@ -1949,7 +1976,8 @@ private:
         meta["files"] = json::array();
         meta["chunks"] = json::array();
         meta["stop_reason"] = nullptr;
-        meta["waveforms_per_file"] = cfg_.waveforms_per_file;
+        meta["chunk_duration_s"] = cfg_.chunk_duration_s;
+        meta["chunk_max_mb"] = cfg_.chunk_max_mb;
         meta["board_health"] = {
             {"start", health_start_ ? board_health_json(*health_start_) : json(nullptr)},
             {"end", nullptr},

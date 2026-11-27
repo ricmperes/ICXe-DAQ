@@ -5,14 +5,14 @@ Cheat sheet for the directory `icxe-daq run` writes. The layout is `encode_wavef
 ## Run directory
 
 ```text
-<data>/<name>_<YYYYMMDDTHHMMSSZ>/
+<data>/<run_mode>_<YYYYMMDDTHHMMSSZ>/
   config.json
   metadata.json
   wf_00000.bin
   wf_00001.bin
 ```
 
-The folder is `<output_directory>/<name>_<UTC>`, UTC as `%Y%m%dT%H%M%SZ`. If that path exists, the name gains `-2`, `-3`, and so on. The example is `data/v1730sb_20261026T143011Z/`.
+The folder is `<output_directory>/<run_mode>_<UTC>` (run IDs replace this in step 2c.4), UTC as `%Y%m%dT%H%M%SZ`. If that path exists, the name gains `-2`, `-3`, and so on. The example is `data/v1730sb_20261026T143011Z/`.
 
 | File | Contents |
 | --- | --- |
@@ -20,7 +20,7 @@ The folder is `<output_directory>/<name>_<UTC>`, UTC as `%Y%m%dT%H%M%SZ`. If tha
 | `metadata.json` | Mask, channel list, record length, time-tag tick, run and chunk times, and the file list. Rewritten as events are stored. |
 | `wf_NNNNN.bin` | Waveform events. The index is zero-based and printed in five digits, so the first file is `wf_00000.bin`. |
 
-`waveforms_per_file` is in both JSON files. One `wf_*.bin` holds at most that many events; the next event opens the next index. The last file holds the remainder. `wf_*.bin` is created on the first event of that file. The example has `waveforms_per_file` 100, `events_written` 10, and one file, `wf_00000.bin`.
+`chunk_duration_s` and `chunk_max_mb` are in both JSON files. A new `wf_*.bin` is started with the first event whose waveform starts `chunk_duration_s` or later after the first waveform of the current file, or whose bytes would make the file larger than `chunk_max_mb` (10^6 bytes). Files therefore end at event boundaries. `wf_*.bin` is created on the first event of that file. Runs written before 2026-11-27 used `waveforms_per_file` (a fixed number of events per file) instead.
 
 ## Event bytes
 
@@ -87,7 +87,13 @@ The event header already carries the mask and the sample count. These metadata f
 | `trigger_time_tag_wrap_ticks` | `2147483648` | Wrap period (`2^31` ticks) used to unwrap the tag. |
 | `waveform_format` | `"ICX2"` | Event magic and header layout of this run. |
 | `sample_period_ns` | `2` | Sample period, from `kSamplePeriodNs` (500 MS/s). |
-| `waveforms_per_file` | `100` | Maximum events in one `wf_*.bin`. |
+| `chunk_duration_s` | `5` | Time span of one `wf_*.bin` (config key, see above). |
+| `chunk_max_mb` | `500` | Size limit of one `wf_*.bin` in MB (config key, see above). |
+| `run_mode` | `"overlap_on"` | Config key `run_mode`. |
+| `tags` | `["bench"]` | Config key `tags`. |
+| `comments` | `[]` | Config key `comments`. |
+| `channel_map` | `{"tpc": [0, 99], ...}` | Config key `channel_map`: detector name → inclusive range of global channel numbers. |
+| `channels` | list | Every channel of the board, enabled or not: `index` (board input), `global_channel`, `detector` (from `channel_map`), `enabled`, `polarity`, `dynamic_range`, `target_percent`, `threshold_counts`, `dac`, and the measured `baseline_mean`, `baseline_rms`, `baseline_within_tolerance` (`null` when not measured). |
 | `files` | `["wf_00000.bin"]` | Names written in this run. |
 | `chunks` | see below | One entry per file, with its time span. |
 | `events_written` | `10` | Events across those files. |
@@ -211,7 +217,7 @@ metadata_channel_mask=0x7
 import json
 import numpy as np
 
-run = "data/<name>_<UTC>"
+run = "data/<run_mode>_<UTC>"
 path = f"{run}/wf_00000.bin"
 with open(path, "rb") as handle:
     prefix = handle.read(28)

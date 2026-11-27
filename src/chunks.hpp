@@ -29,6 +29,20 @@ private:
     bool have_prev_ = false;
 };
 
+// When a chunk (waveform file) is closed: chunk_duration_s and chunk_max_mb of the config.
+struct ChunkLimits {
+    int64_t duration_ns = 0;
+    uint64_t max_bytes = 0;
+};
+
+ChunkLimits chunk_limits(double chunk_duration_s, double chunk_max_mb);
+
+// True when the next event must open a new chunk: its waveform starts chunk duration or
+// later after the first waveform of the current chunk, or adding its bytes would make the
+// chunk larger than the limit. A chunk always takes at least one event.
+bool is_chunk_full(const ChunkLimits& limits, int64_t first_waveform_start_ns,
+                   int64_t waveform_start_ns, uint64_t chunk_bytes, uint64_t event_bytes);
+
 struct ChunkInfo {
     int index = 0;
     std::string file;

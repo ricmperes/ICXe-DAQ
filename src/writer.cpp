@@ -78,6 +78,10 @@ void SampleCountSummary::add(uint32_t sample_count) {
     maximum_ = maximum_ ? std::max(*maximum_, sample_count) : sample_count;
 }
 
+uint64_t encoded_event_bytes(const WaveformEvent& event) {
+    return kWaveHeaderBytes + 2u * static_cast<uint64_t>(event.samples.size());
+}
+
 std::string encode_waveform_event(const WaveformEvent& event) {
     const int nch = popcount_u32(event.channel_mask);
     const std::size_t expect =
@@ -160,12 +164,7 @@ std::vector<WaveformEvent> read_waveform_file(const std::filesystem::path& path)
     return events;
 }
 
-WaveformWriter::WaveformWriter(std::filesystem::path run_dir, uint32_t waveforms_per_file)
-    : run_dir_(std::move(run_dir)), per_file_(waveforms_per_file) {
-    if (per_file_ == 0) {
-        throw std::runtime_error("waveforms_per_file must be >= 1");
-    }
-}
+WaveformWriter::WaveformWriter(std::filesystem::path run_dir) : run_dir_(std::move(run_dir)) {}
 
 WaveformWriter::~WaveformWriter() {
     if (fd_ >= 0) {
@@ -190,16 +189,16 @@ void WaveformWriter::open_next() {
                                  std::strerror(errno));
     }
     filenames_.emplace_back(name);
-    in_file_ = 0;
+    bytes_in_file_ = 0;
 }
 
-void WaveformWriter::write_event(const WaveformEvent& event) {
-    if (fd_ < 0 || in_file_ >= per_file_) {
+void WaveformWriter::write_event(const WaveformEvent& event, bool begins_new_file) {
+    if (fd_ < 0 || begins_new_file) {
         open_next();
     }
     const std::string bytes = encode_waveform_event(event);
     write_all(fd_, bytes.data(), bytes.size());
-    ++in_file_;
+    bytes_in_file_ += bytes.size();
     ++events_written_;
 }
 

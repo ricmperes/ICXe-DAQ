@@ -1,8 +1,16 @@
 {
-  "name": "mon_test",
+  "run_mode": "mon_test",
+  "tags": [],
+  "comments": [],
+  "channel_map": {
+    "tpc": [0, 99],
+    "external": [100, 199],
+    "aqmon": [200, 299]
+  },
   "output_directory": "data",
   "duration_s": 60,
-  "waveforms_per_file": 10000,
+  "chunk_duration_s": 5,
+  "chunk_max_mb": 500,
   "record_length": 2500,
   "pre_trigger_samples": 750,
   "n_buffers": null,
@@ -50,22 +58,22 @@
       ],
       "register_writes": [],
       "channels": [
-        {"index": 0, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 1, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 2, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 3, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 4, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 5, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 6, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 7, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 8, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 9, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 10, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 11, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 12, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 13, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 14, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
-        {"index": 15, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"}
+        {"index": 0, "global_channel": 200, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 1, "global_channel": 201, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 2, "global_channel": 202, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 3, "global_channel": 203, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 4, "global_channel": 204, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 5, "global_channel": 205, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 6, "global_channel": 206, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 7, "global_channel": 207, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 8, "global_channel": 208, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 9, "global_channel": 209, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 10, "global_channel": 210, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 11, "global_channel": 211, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 12, "global_channel": 212, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 13, "global_channel": 213, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 14, "global_channel": 214, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 15, "global_channel": 215, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"}
       ]
     }
   ]

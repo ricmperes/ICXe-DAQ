@@ -3,6 +3,7 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 TimeTagUnwrapper::TimeTagUnwrapper(int64_t acquisition_start_ns)
@@ -79,6 +80,23 @@ void ChunkTracker::add_event(int file_index, const std::string& file, uint32_t e
     ++chunk.n_events;
     chunk.last_event_counter = event_counter;
     chunk.last_waveform_end_ns = std::max(chunk.last_waveform_end_ns, wf_end);
+}
+
+ChunkLimits chunk_limits(double chunk_duration_s, double chunk_max_mb) {
+    ChunkLimits limits;
+    limits.duration_ns = std::llround(chunk_duration_s * 1e9);
+    limits.max_bytes = static_cast<uint64_t>(std::llround(chunk_max_mb * 1e6));
+    return limits;
+}
+
+bool is_chunk_full(const ChunkLimits& limits, int64_t first_waveform_start_ns,
+                   int64_t waveform_start_ns, uint64_t chunk_bytes, uint64_t event_bytes) {
+    if (chunk_bytes == 0u) {
+        return false;
+    }
+    const bool is_too_long = waveform_start_ns - first_waveform_start_ns >= limits.duration_ns;
+    const bool is_too_large = chunk_bytes + event_bytes > limits.max_bytes;
+    return is_too_long || is_too_large;
 }
 
 int64_t ChunkTracker::close_at_last_waveform(int64_t no_chunk_ns) {

@@ -50,6 +50,9 @@ struct RegisterWrite {
 
 struct ChannelConfig {
     int index = 0;
+    // Channel number in the data (channel map); detector is the channel_map range it is in.
+    int global_channel = 0;
+    std::string detector;
     bool enabled = true;
     Polarity polarity = Polarity::Negative;
     double target_percent = 50;
@@ -73,6 +76,14 @@ struct ConnectionConfig {
     bool use_vme_base_address = false;
 };
 
+// One entry of channel_map: global channel numbers first..last (inclusive) belong to
+// the named detector.
+struct DetectorRange {
+    std::string detector;
+    int first = 0;
+    int last = 0;
+};
+
 // Settings of one board: the shared part of the config file merged with one
 // entry of its "boards" list.
 struct Config {
@@ -81,12 +92,17 @@ struct Config {
     // Copy of the file's protected_serials, so the opened board can be checked.
     std::vector<uint32_t> protected_serials;
     ClockSource clock_source = ClockSource::Internal;
-    std::string name = "run";
+    std::string run_mode;
+    std::vector<std::string> tags;
+    std::vector<std::string> comments;
+    // Copy of the file's channel_map.
+    std::vector<DetectorRange> channel_map;
     std::string output_directory = "data";
     double duration_s = 0;
     // Set by --duration S of run / scope (then duration_s holds S); not a JSON key.
     std::optional<double> duration_s_from_command_line;
-    uint32_t waveforms_per_file = 1000;
+    double chunk_duration_s = 5;
+    double chunk_max_mb = 500;
     uint32_t record_length = 0;
     uint32_t pre_trigger_samples = 0;
     uint32_t post_trigger_percent = 0;
@@ -113,7 +129,12 @@ struct RunConfig {
     std::vector<Config> boards;
     // Serials the program must never open for writing (boards of other users).
     std::vector<uint32_t> protected_serials;
+    std::vector<DetectorRange> channel_map;
 };
+
+// Detector of a global channel number, or empty when no channel_map range holds it.
+std::optional<std::string> detector_of(const std::vector<DetectorRange>& channel_map,
+                                       int global_channel);
 
 const char* to_string(Polarity p);
 const char* to_string(DynamicRange r);

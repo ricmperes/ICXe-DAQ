@@ -392,11 +392,13 @@ bool load_fails_with(const fs::path& path, const json& config, F&& change,
     return throws_with([&] { load_json(path, changed); }, fragment);
 }
 
-// All 16 channels; the channels in enabled_mask are enabled.
-json full_channels(uint32_t enabled_mask) {
+// All 16 channels; the channels in enabled_mask are enabled. Global channel numbers
+// first_global_channel to first_global_channel + 15.
+json full_channels(uint32_t enabled_mask, int first_global_channel) {
     json channels = json::array();
     for (int index = 0; index < 16; ++index) {
         channels.push_back({{"index", index},
+                            {"global_channel", first_global_channel + index},
                             {"enabled", (enabled_mask & (1u << index)) != 0u},
                             {"polarity", "negative"},
                             {"target_percent", 85},
@@ -407,12 +409,12 @@ json full_channels(uint32_t enabled_mask) {
 }
 
 json full_board(const std::string& name, const std::string& base, uint32_t serial,
-                const std::string& clock) {
+                const std::string& clock, int first_global_channel) {
     return {{"name", name},
             {"vme_base_address", base},
             {"serial", serial},
             {"clock_source", clock},
-            {"channels", full_channels(0x5u)},
+            {"channels", full_channels(0x5u, first_global_channel)},
             {"coincidence", nullptr},
             {"trigger_request_channels", json::array()},
             {"register_writes", json::array()}};
@@ -420,10 +422,14 @@ json full_board(const std::string& name, const std::string& base, uint32_t seria
 
 // Complete config with every key; boards B1 to B4 through the V4718.
 json full_config() {
-    return {{"name", "fixture"},
+    return {{"run_mode", "fixture"},
+            {"tags", {"bench"}},
+            {"comments", {"self-test fixture"}},
+            {"channel_map", {{"tpc", {0, 99}}, {"external", {100, 199}}, {"aqmon", {200, 299}}}},
             {"output_directory", "data"},
             {"duration_s", 0},
-            {"waveforms_per_file", 1000},
+            {"chunk_duration_s", 5},
+            {"chunk_max_mb", 500},
             {"record_length", 2500},
             {"pre_trigger_samples", 750},
             {"n_buffers", nullptr},
@@ -445,17 +451,17 @@ json full_config() {
             {"accept_overlapping_triggers", true},
             {"protected_serials", {30176}},
             {"boards",
-             {full_board("B1", "0x32100000", 30165, "internal"),
-              full_board("B2", "0x32110000", 30166, "external"),
-              full_board("B3", "0x32120000", 30167, "external"),
-              full_board("B4", "0x32130000", 30168, "external")}}};
+             {full_board("B1", "0x32100000", 30165, "internal", 0),
+              full_board("B2", "0x32110000", 30166, "external", 16),
+              full_board("B3", "0x32120000", 30167, "external", 32),
+              full_board("B4", "0x32130000", 30168, "external", 48)}}};
 }
 
 // One board on its own optical port (open base 0).
 json single_board_config() {
     json config = full_config();
     config["connection"]["use_vme_base_address"] = false;
-    config["boards"] = json::array({full_board("B1", "0x32140000", 30165, "internal")});
+    config["boards"] = json::array({full_board("B1", "0x32140000", 30165, "internal", 0)});
     return config;
 }
 
@@ -479,7 +485,12 @@ void test_config(const fs::path& dir) {
     CHECK(cfg.pre_trigger_samples == 750);
     CHECK(cfg.post_trigger_percent == 70);
     CHECK(cfg.buffer.nb == 1024);
-    CHECK(cfg.waveforms_per_file == 1000);
+    CHECK(cfg.run_mode == "fixture");
+    CHECK(cfg.tags == std::vector<std::string>{"bench"});
+    CHECK(cfg.comments == std::vector<std::string>{"self-test fixture"});
+    CHECK(cfg.chunk_duration_s == 5.0 && cfg.chunk_max_mb == 500.0);
+    CHECK(cfg.channel_map.size() == 3);
+    CHECK(cfg.channels[3].global_channel == 3 && cfg.channels[3].detector == "tpc");
     CHECK(cfg.max_events_blt == 32);
     CHECK(cfg.output_directory == "data");
     CHECK(cfg.trigger == TriggerType::External);
@@ -552,7 +563,7 @@ void test_every_key_required(const fs::path& dir) {
     check_removal("board B3", [](json& c) -> json& { return c["boards"][2]; });
     check_removal("B3 coincidence", [](json& c) -> json& { return c["boards"][2]["coincidence"]; });
     check_removal("B3 channel 5", [](json& c) -> json& { return c["boards"][2]["channels"][5]; });
-    CHECK(checked == 17 + 4 + 4 + 3 + 2 + 2 + 3 + 8 + 3 + 6);
+    CHECK(checked == 21 + 4 + 4 + 3 + 2 + 2 + 3 + 8 + 3 + 7);
 
     CHECK(load_fails_with(path, config, [](json& c) { c["boards"][1]["channels"].erase(15); },
                           "board B2: channels must list all 16 channels"));
@@ -627,7 +638,7 @@ void test_run_config(const fs::path& dir) {
                           [](json& c) { c["connection"]["use_vme_base_address"] = false; },
                           "use_vme_base_address true"));
     json one = base;
-    one["boards"] = json::array({full_board("B2", "0x32110000", 30166, "external")});
+    one["boards"] = json::array({full_board("B2", "0x32110000", 30166, "external", 16)});
     CHECK(load_json(path, one).boards.size() == 1);
 
     CHECK(load_fails_with(path, base, [](json& c) { c["channels"] = json::array(); },
@@ -692,7 +703,8 @@ void test_run_config(const fs::path& dir) {
             const uint32_t slot = static_cast<uint32_t>(slots[i]);
             random_config["boards"].push_back(
                 full_board("board_" + std::to_string(slot), hex32(0x32000000u + 0x10000u * slot),
-                           20000u + 7u * slot, i == master ? "internal" : "external"));
+                           20000u + 7u * slot, i == master ? "internal" : "external",
+                           16 * static_cast<int>(slot)));
         }
         const RunConfig random_run = load_json(path, random_config);
         CHECK(static_cast<int>(random_run.boards.size()) == board_count);
@@ -718,7 +730,7 @@ void test_run_config(const fs::path& dir) {
 void test_bench_keys(const fs::path& dir) {
     const fs::path path = dir / "bench_keys.json";
     json base = single_board_config();
-    base["boards"][0]["channels"] = full_channels(0x7u);
+    base["boards"][0]["channels"] = full_channels(0x7u, 0);
     const auto load_changed = [&](const auto& change) {
         json changed = base;
         change(changed);
@@ -824,6 +836,103 @@ void test_status_check_schedule() {
         CHECK(next > checked);
         CHECK(next <= checked + 1.0);
         CHECK(checked - due >= 1.0 || next == due + 1.0);
+    }
+}
+
+void test_channel_map_and_run_info(const fs::path& dir) {
+    const fs::path path = dir / "channel_map.json";
+    const json base = full_config();
+    const RunConfig run = load_json(path, base);
+    CHECK(run.channel_map.size() == 3);
+    CHECK(run.boards[3].channels[15].global_channel == 63);
+    CHECK(run.boards[3].channels[15].detector == "tpc");
+
+    json mixed = base;
+    mixed["boards"][3]["channels"][14]["global_channel"] = 100;
+    mixed["boards"][3]["channels"][15]["global_channel"] = 215;
+    const RunConfig mixed_run = load_json(path, mixed);
+    CHECK(mixed_run.boards[3].channels[14].detector == "external");
+    CHECK(mixed_run.boards[3].channels[15].detector == "aqmon");
+
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][1]["channels"][2]["global_channel"] = 5; },
+                          "global_channel 5 is used by B1 channel 5 and B2 channel 2"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][0]["channels"][0]["global_channel"] = 300; },
+                          "global_channel 300 is in no range of channel_map"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][0]["channels"][0]["global_channel"] = -1; },
+                          "global_channel must be 0..32767"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["channel_map"]["aqmon"] = {150, 250}; },
+                          "overlap"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["channel_map"]["aqmon"] = {250, 200}; },
+                          "first <= last"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["channel_map"]["aqmon"] = 200; },
+                          "channel_map.aqmon must be [first, last]"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["channel_map"] = json::object(); },
+                          "channel_map must be an object"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["tags"] = {"bench,test"}; },
+                          "contains a comma"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["tags"] = {""}; },
+                          "tags entries must be non-empty strings"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["comments"] = "one comment"; },
+                          "comments must be a list of strings"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["run_mode"] = "bad mode"; },
+                          "run_mode must be"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["chunk_duration_s"] = 0; },
+                          "chunk_duration_s must be > 0"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["chunk_max_mb"] = 0.5; },
+                          "chunk_max_mb must be >= 1"));
+    json empty_lists = base;
+    empty_lists["tags"] = json::array();
+    empty_lists["comments"] = json::array();
+    CHECK(load_json(path, empty_lists).boards[0].tags.empty());
+
+    // Random channel maps: detector_of agrees with a direct search over all numbers.
+    std::mt19937 generator(20261127u);
+    for (int trial = 0; trial < 300; ++trial) {
+        std::vector<DetectorRange> ranges;
+        int next_free = std::uniform_int_distribution<int>(0, 50)(generator);
+        const int range_count = std::uniform_int_distribution<int>(1, 5)(generator);
+        for (int i = 0; i < range_count; ++i) {
+            const int width = std::uniform_int_distribution<int>(1, 120)(generator);
+            ranges.push_back({"d" + std::to_string(i), next_free, next_free + width - 1});
+            next_free += width + std::uniform_int_distribution<int>(0, 30)(generator);
+        }
+        std::shuffle(ranges.begin(), ranges.end(), generator);
+        for (int channel = 0; channel < next_free + 10; ++channel) {
+            std::optional<std::string> expected;
+            for (const DetectorRange& range : ranges) {
+                if (range.first <= channel && channel <= range.last) {
+                    expected = range.detector;
+                }
+            }
+            CHECK(detector_of(ranges, channel) == expected);
+        }
+    }
+}
+
+void test_chunk_limits() {
+    const ChunkLimits limits = chunk_limits(5.0, 500.0);
+    CHECK(limits.duration_ns == 5000000000LL && limits.max_bytes == 500000000u);
+    CHECK(!is_chunk_full(limits, 0, 9000000000LL, 0, 1000));
+    CHECK(!is_chunk_full(limits, 0, 4999999999LL, 1000, 1000));
+    CHECK(is_chunk_full(limits, 0, 5000000000LL, 1000, 1000));
+    CHECK(!is_chunk_full(limits, 0, 1, 499999000u, 1000));
+    CHECK(is_chunk_full(limits, 0, 1, 499999001u, 1000));
+    CHECK(!is_chunk_full(limits, 0, 1, 0, 900000000u));
+
+    std::mt19937 generator(20261127u);
+    std::uniform_int_distribution<int64_t> any_offset(0, 10000000000LL);
+    std::uniform_int_distribution<uint64_t> any_bytes(0, 1000000000u);
+    for (int trial = 0; trial < 5000; ++trial) {
+        const int64_t first = any_offset(generator);
+        const int64_t start = first + any_offset(generator);
+        const uint64_t chunk_bytes = any_bytes(generator);
+        const uint64_t event_bytes = any_bytes(generator) / 100u;
+        const bool expected = chunk_bytes > 0u && (start - first >= limits.duration_ns ||
+                                                   chunk_bytes + event_bytes > limits.max_bytes);
+        CHECK(is_chunk_full(limits, first, start, chunk_bytes, event_bytes) == expected);
     }
 }
 
@@ -1007,14 +1116,16 @@ void test_writer(const fs::path& dir) {
     }
 
     {
-        WaveformWriter writer(run, 2);
+        WaveformWriter writer(run);
         for (uint32_t i = 0; i < 3; ++i) {
             ev.event_counter = 1000u + i;
             ev.trigger_time_tag = 50u + i;
             ev.trigger_time_ticks = (3ull << 31) + 50u + i;
-            writer.write_event(ev);
+            writer.write_event(ev, i == 2u);
+            CHECK(writer.bytes_in_file() == (i == 2u ? 1u : i + 1u) * encoded_event_bytes(ev));
         }
         writer.flush();
+        CHECK(encoded_event_bytes(ev) == encode_waveform_event(ev).size());
         CHECK(writer.events_written() == 3);
         CHECK(writer.filenames().size() == 2);
         CHECK(writer.filenames()[0] == "wf_00000.bin");
@@ -1076,7 +1187,7 @@ void test_writer(const fs::path& dir) {
         fs::create_directories(mixed_run);
         const uint32_t lengths[] = {8u, 3u, 8u};
         {
-            WaveformWriter writer(mixed_run, 10);
+            WaveformWriter writer(mixed_run);
             for (uint32_t i = 0; i < 3; ++i) {
                 WaveformEvent mixed;
                 mixed.event_counter = i;
@@ -1085,7 +1196,7 @@ void test_writer(const fs::path& dir) {
                 for (uint32_t s = 0; s < 2 * lengths[i]; ++s) {
                     mixed.samples.push_back(static_cast<int16_t>(100 * i + s));
                 }
-                writer.write_event(mixed);
+                writer.write_event(mixed, false);
             }
             writer.flush();
         }
@@ -1134,6 +1245,8 @@ int run_self_test(const std::string& config_path) {
         test_every_key_required(dir);
         test_run_config(dir);
         test_duration_option(dir);
+        test_channel_map_and_run_info(dir);
+        test_chunk_limits();
         test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {

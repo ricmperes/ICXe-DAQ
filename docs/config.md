@@ -12,6 +12,8 @@ One file describes a run on one or several boards: shared settings at the top le
 
 Complete example: `config/four_boards.json`. The other files in `config/`: `overlap_on.json` / `overlap_off.json` (B1, the overlap bench test), and `default.json`, `mon_test.json`, `PMT1.json`, `PMT_ext.json` (the board on its own optical port, serial 30176, named B5; refused while 30176 is protected).
 
+Order of the top-level keys in the files: run description, channel map, output and stop, record and buffer, connection, baseline, trigger, then `boards`. The order has no meaning for the program.
+
 `icxe-daq info`, `run`, `scope` and `reg` work on one board. With a file that lists several boards, `--board NAME` says which one (`--board B3`); with a one-board file it can be left out. A run on several boards at once comes with step 2c.4 (PLAN.md).
 
 ## Order of a run
@@ -26,14 +28,30 @@ What the program does with the keys, in this order, so the descriptions below ca
 
 ## Shared keys
 
+### Run description
+
+These keys describe the run for the analysis. They do not change anything on the boards. They are written to the metadata, and from step 2c.4 also to the strax run-metadata file, where `st.select_runs` searches them ([icx3_proposal.md](icx3_proposal.md), section 6).
+
+| Path | Type | Allowed | What it does |
+| --- | --- | --- | --- |
+| `run_mode` | string | 1..64 of letters, digits, `-`, `_` | What kind of run this config makes, e.g. `tpc_external_trigger` or `overlap_on`. Becomes the strax run mode (`st.select_runs(run_mode=...)`). Until the run IDs of 2c.4 exist, it also names the run directory: `<output_directory>/<run_mode>_<UTC start time>`, e.g. `data/four_boards_20261127T101500Z`; if that exists, `-2`, `-3`, … is appended. |
+| `tags` | list of strings | each non-empty and without commas; `[]` for none | Labels for finding runs later, e.g. `["bench", "afg"]`. Become the strax run tags (`st.select_runs(include_tags=...)`). Commas are not allowed because strax joins the tags of a run with commas before matching. |
+| `comments` | list of strings | each non-empty; `[]` for none | Free text about the run, e.g. `["AFG bursts of 2 pulses, 2 us apart"]`. Copied into the metadata and the strax run comments. Change it in the file before each run if it should describe that run. |
+
+### Channel map
+
+| Path | Type | Allowed | What it does |
+| --- | --- | --- | --- |
+| `channel_map` | object: detector name → `[first, last]` | at least one entry; names 1..64 of letters, digits, `-`, `_`; `0 <= first <= last <= 32767`; ranges must not overlap | Splits the global channel numbers into detectors, as the channel map of straxen. Both numbers are included: `"tpc": [0, 99]` means channels 0 to 99. Every channel's `global_channel` must lie in one range, and that range gives the channel's detector in the metadata. Agreed for this setup: `tpc` 0–99, `external` 100–199, `aqmon` 200–299. The processing reads its own index ranges (e.g. `top_pmt_indices` in abstrax's `detector.yaml`) and does not depend on these names. |
+
 ### Output and stop
 
 | Path | Type | Allowed | What it does |
 | --- | --- | --- | --- |
-| `name` | string | 1..64 of letters, digits, `-`, `_` | Name of the run. The run directory is `<output_directory>/<name>_<UTC start time>`, e.g. `data/four_boards_20261127T101500Z`; if that exists, `-2`, `-3`, … is appended. Use it to tell runs apart (e.g. `overlap_on_4us`). |
 | `output_directory` | string | non-empty | Folder in which the run directory is created (relative to where the program is started, or absolute). It is created if missing. |
 | `duration_s` | number | `>= 0` | Length of the acquisition in seconds, counted from the start of acquisition (the baseline step before it does not count). `0` means no time limit: the run then stops only on `--max-events N` or Ctrl-C / SIGTERM. |
-| `waveforms_per_file` | integer | `>= 1` | Number of events in one waveform file `wf_XXXXX.bin` (one chunk). When a file is full, the next one is opened. Small values give many small chunks; each chunk gets its own start and end time in the metadata. |
+| `chunk_duration_s` | number | `> 0` | Time span of one waveform file `wf_XXXXX.bin` (one chunk). A new file is started with the first event whose waveform starts this long or longer after the first waveform of the current file, so files close at event boundaries and never split a waveform. The processing (strax) combines chunks when it saves data, so this mainly sets how soon a chunk is complete for online processing; 5 s is a good start. |
+| `chunk_max_mb` | number | `>= 1` | Upper limit for one waveform file in MB (10^6 bytes). A file that would grow beyond it is closed early, at the next event, even if `chunk_duration_s` has not passed. It protects against huge files at high rates (all channels at a high trigger rate can write hundreds of MB per second). 500 is a good start. |
 
 `run --max-events N` (`N >= 1`), SIGINT, and SIGTERM also stop a run. They are not JSON keys. `--duration S` (`run` and `scope`, seconds `> 0`, e.g. `10` or `2.5`) replaces `duration_s` for that run, so the same config can be used for runs of different length. The copy `config.json` in the run directory still shows the file's `duration_s`; the limits actually used are in the metadata, `stop_conditions` ([data_format.md](data_format.md)). `scope` ignores `--max-events`.
 
@@ -150,6 +168,7 @@ Each board lists all 16 channels. Only enabled channels are programmed and store
 | Path | Type | Allowed | What it does |
 | --- | --- | --- | --- |
 | `channels[].index` | integer | `0..15`, each once | Channel number on the board (front-panel input). |
+| `channels[].global_channel` | integer | `0..32767`, unique over all boards, inside one `channel_map` range | Channel number of this input in the data and in the processing (the strax `channel`). Set it from the cabling: which sensor is plugged into this input. It is required also for disabled channels, so a sensor keeps its number when it is switched off. The files in `config/` use placeholders until the TPC cabling is known: B1 0–15, B2 16–31, B3 32–47, B4 48–63, B5 200–215. |
 | `channels[].enabled` | boolean | `true` or `false` | `true`: the channel is recorded; every event stores its waveform. `false`: the channel is not recorded and takes no space in the files. With an external trigger, every enabled channel stores a waveform for every trigger, whether it saw a pulse or not. |
 | `channels[].polarity` | string | `positive`, `negative` | Direction of the pulses: `negative` for PMT and SiPM pulses that go down. Sets the threshold side (below or above the baseline) and the trigger edge (falling for negative, rising for positive). |
 | `channels[].target_percent` | number | `0..100` | Where the baseline sits in the 14-bit ADC range (0 to 16383), in percent, set with the channel's DC offset. Negative pulses need room below the baseline, so a high value (`85` = ADC 13926, leaving 85 % of the range for the pulse); positive pulses a low value (`15`). Reached precisely only with `baseline.apply_on_start`. |
