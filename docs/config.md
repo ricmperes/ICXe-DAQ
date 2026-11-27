@@ -18,11 +18,11 @@ Complete example: `config/four_boards.json`. The other files in `config/`: `over
 
 What the program does with the keys, in this order, so the descriptions below can refer to it:
 
-1. Open the board (connection, `boards[].vme_base_address`).
+1. Open the board (connection, `boards[].vme_base_address`), check that it reports `boards[].serial` and is not protected, and check its status (clock source as `boards[].clock_source`, channels not in over-temperature shutdown, PLL locked). Nothing is written before these checks pass.
 2. Reset the board, then program record length, pre-trigger, buffers, I/O level, enabled channels, polarity, dynamic range and the nominal DC offset of each enabled channel.
 3. Baseline step (`baseline`): ADC calibration, then the DC offset is adjusted until each channel sits at its `target_percent`. Uses software triggers; nothing is written to disk.
 4. Arm the trigger (`trigger`, `boards[].coincidence`), then `trigger_requests`, `analog_monitor`, `accept_overlapping_triggers`, `register_writes`, in this order. Every register written here is read back; the values go to stderr and `metadata.json`.
-5. Acquire and write files until a stop condition (`duration_s`, `--max-events`, Ctrl-C).
+5. Check the status once more (now also "board ready"), record temperatures, then acquire and write files until a stop condition (`duration_s`, `--max-events`, Ctrl-C). The status is checked once per second; a problem (over-temperature, shutdown, clock or PLL) stops the run with `stop_reason` `board_status` ([data_format.md](data_format.md)).
 
 ## Shared keys
 
@@ -114,7 +114,7 @@ A trigger request is the board's own decision that a channel is over threshold. 
 
 | Path | Type | Allowed | What it does |
 | --- | --- | --- | --- |
-| `protected_serials` | array of integers | positive integers, or `[]` | Serial numbers of boards that belong to other users and must never be opened, reset or reprogrammed. A board entry with one of these serials is refused when the config is loaded, before anything is opened. From step 2c.3 the serial each board reports is also checked against this list. `[]`: no protected boards. |
+| `protected_serials` | array of integers | positive integers, or `[]` | Serial numbers of boards that belong to other users and must never be opened, reset or reprogrammed. A board entry with one of these serials is refused when the config is loaded, before anything is opened. After opening, the serial the board reports is also checked against this list, so a wrong base address that reaches a protected board stops before any write. `[]`: no protected boards. |
 
 ## Boards
 
@@ -124,8 +124,8 @@ A trigger request is the board's own decision that a channel is over threshold. 
 | --- | --- | --- | --- |
 | `boards[].name` | string | 1..64 of letters, digits, `-`, `_` | Name of the board, used by `--board`, in error messages and in the metadata. Convention: B1 to B4 from left to right in the crate. |
 | `boards[].vme_base_address` | string | whole string parses as a 32-bit integer (`0x` hex or decimal) | The board's VME address, set with its rotary switches (four switches 3, 2, 1, 0 give `0x32100000`). The V4718 reaches the board under this address. Not used when `connection.use_vme_base_address` is `false`. |
-| `boards[].serial` | integer | `>= 1`, not in `protected_serials` | Serial number printed on the board and reported by `info`. Guards against a wrong address reaching another board: from step 2c.3 the program stops before writing anything if the board reports a different serial. |
-| `boards[].clock_source` | string | `internal`, `external` | Which clock the board runs on, as set by its clock switch (SW4 on our boards): `internal` for the clock master (B1), `external` for boards that get the clock from the board before them in the CLK-OUT → CLK-IN chain. The program cannot set this; from step 2c.3 it checks it (register 0x8104 bit 5) and stops on a mismatch. |
+| `boards[].serial` | integer | `>= 1`, not in `protected_serials` | Serial number printed on the board and reported by `info`. Guards against a wrong address reaching another board: right after opening, every command (`info`, `reg`, `run`, `scope`) compares the serial the board reports with this value and stops before writing anything if they differ (`info` prints the board first, so you can see what is at that address). |
+| `boards[].clock_source` | string | `internal`, `external` | Which clock the board runs on, as set by its clock switch (SW4 on our boards): `internal` for the clock master (B1), `external` for boards that get the clock from the board before them in the CLK-OUT → CLK-IN chain. The program cannot set this; `run` and `scope` check it (register 0x8104 bit 5) before programming, before the start and once per second, and stop on a mismatch. `info` shows it. |
 | `boards[].coincidence` | object or null | object below, or `null` | Self-trigger logic of this board: which channel pairs must be over threshold to start an event. Required when `trigger.type` is `coincidence`; `null` otherwise (a present object is still checked). |
 | `boards[].trigger_request_channels` | array of integers | enabled channels with `threshold >= 1`; non-empty when `trigger_requests` is an object, `[]` when it is `null` | Channels of this board that get threshold detection from `trigger_requests` (e.g. the channels that should contribute to MON/Σ). |
 | `boards[].register_writes` | array | as `register_writes`, or `[]` | Raw writes for this board only, applied after the shared `register_writes`. |

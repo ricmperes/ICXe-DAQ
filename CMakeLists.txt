@@ -12,6 +12,7 @@ endif()
 add_executable(icxe-daq
   src/main.cpp
   src/config.cpp
+  src/board_status.cpp
   src/buffers.cpp
   src/chunks.cpp
   src/coincidence.cpp

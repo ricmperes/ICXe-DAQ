@@ -120,6 +120,18 @@ Each string and its `_unix_time_ns` partner describe the same instant; the strin
 
 The clock is the PC wall clock, so its accuracy is that of the host time sync (NTP, typically about a millisecond), not nanoseconds. The board resets its trigger time tag when acquisition actually starts, which is shortly after `acquisition_start_unix_time_ns`, so absolute event times can be early by that delay (milliseconds at most).
 
+## Stop reason and board health
+
+| Field | Example | Role |
+| --- | --- | --- |
+| `stop_reason` | `"max_events"` | Why the run ended: `duration`, `max_events`, `sigint`, `sigterm`, `board_status` (a status check found a problem, see `board_health.problems`; the program then exits with an error), or `error` (an exception; files are closed as far as possible). |
+| `board_health.start` | object | Board state just before the acquisition starts: `acquisition_status_0x8104` (raw value and decoded flags: running, memory full, external clock, PLL lock kept, board ready, channels shut down, overheated channels), `board_failure_status_0x8178` (raw value and PLL lock loss, temperature failure, ADC power down), and `adc_temperatures_celsius` (16 values, ADC chip temperature of each channel, register 0x1nA8). |
+| `board_health.end` | object or `null` | Same, read after the acquisition stopped. `null` while the run is in progress, or when the board could not be read at the end. |
+| `board_health.status_checks_during_run` | `61` | How many times 0x8104 was checked during the run (once per second). |
+| `board_health.problems` | `[]` | Problems found by the last check, one sentence each. Empty for a run that ended normally. |
+
+The board protects itself above 85 °C (V1730S): it turns off the channels of the hot 4-channel group and stops its acquisition (UM5118, 0x8104 bits 23:20 and 19). The status checks stop the run with `stop_reason` `board_status` when that happens, when the clock source differs from `boards[].clock_source`, or when the PLL loses lock.
+
 ## Chunks
 
 Each `wf_NNNNN.bin` is one chunk. `chunks` lists them in order:
