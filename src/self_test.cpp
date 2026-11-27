@@ -5,6 +5,9 @@
 #include "chunks.hpp"
 #include "coincidence.hpp"
 #include "config.hpp"
+#include "icx3.hpp"
+#include "merge.hpp"
+#include "run_registry.hpp"
 #include "util.hpp"
 #include "writer.hpp"
 
@@ -18,7 +21,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <random>
+#include <set>
+#include <thread>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,14 +62,111 @@ void test_utc_stamp() {
     const std::time_t after = std::time(nullptr);
     const int64_t sec = s.unix_ns / 1000000000LL;
     CHECK(sec >= static_cast<int64_t>(before) && sec <= static_cast<int64_t>(after));
-    CHECK(s.iso.size() == 20 && s.iso.back() == 'Z');
-    // The ISO string is the whole-second part of the same reading.
+    CHECK(s.iso.size() == 30 && s.iso.back() == 'Z');
+    // The string is the same reading, to the ns.
     const std::time_t t = static_cast<std::time_t>(sec);
     std::tm tm{};
     gmtime_r(&t, &tm);
     char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    CHECK(s.iso == buf);
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    char fraction[16];
+    std::snprintf(fraction, sizeof(fraction), ".%09lldZ",
+                  static_cast<long long>(s.unix_ns % 1000000000LL));
+    CHECK(s.iso == std::string(buf) + fraction);
+    // Reference values from Python's datetime.
+    CHECK(utc_text_from_ns(0) == "1970-01-01T00:00:00.000000000Z");
+    CHECK(utc_text_from_ns(1795779707385123456LL) == "2026-11-27T11:41:47.385123456Z");
+    CHECK(utc_text_from_ns(1795779707000000001LL) == "2026-11-27T11:41:47.000000001Z");
+}
+
+void test_run_registry(const fs::path& dir) {
+    CHECK(format_run_id(1) == "000001" && format_run_id(42) == "000042");
+    CHECK(format_run_id(1234567) == "1234567");
+    CHECK(throws_with([] { format_run_id(0); }, "run number must be"));
+    CHECK(floor_to_ms(1795779707385999999LL) == 1795779707385LL);
+    CHECK(ceil_to_ms(1795779707385000001LL) == 1795779707386LL);
+    CHECK(ceil_to_ms(1795779707385000000LL) == 1795779707385LL);
+    std::mt19937_64 generator(20261127u);
+    for (int trial = 0; trial < 5000; ++trial) {
+        const int64_t ns = static_cast<int64_t>(generator() % 4000000000000000000ULL);
+        CHECK(floor_to_ms(ns) * 1000000 <= ns && ns < (floor_to_ms(ns) + 1) * 1000000);
+        CHECK(ceil_to_ms(ns) * 1000000 >= ns && ns > (ceil_to_ms(ns) - 1) * 1000000);
+        CHECK(utc_text_from_ns(ns).size() == 30u);
+    }
+
+    const fs::path output = dir / "run-registry";
+    fs::remove_all(output);
+    const RunDirectory first = create_run_directory(output);
+    CHECK(first.run_number == 1 && first.run_id == "000001" && fs::is_directory(first.path));
+    CHECK(create_run_directory(output).run_id == "000002");
+    std::ifstream counter_in(output / "last_run_number");
+    std::string counter_text;
+    counter_in >> counter_text;
+    CHECK(counter_text == "2");
+    fs::remove(output / "last_run_number");
+    CHECK(create_run_directory(output).run_id == "000003");
+    fs::create_directory(output / "000010");
+    fs::create_directory(output / "overlap_on_20261127T093731Z");
+    CHECK(create_run_directory(output).run_id == "000011");
+    {
+        std::ofstream counter_out(output / "last_run_number");
+        counter_out << "20\n";
+    }
+    CHECK(create_run_directory(output).run_id == "000021");
+    {
+        std::ofstream counter_out(output / "last_run_number");
+        counter_out << "twenty\n";
+    }
+    CHECK(throws_with([&] { create_run_directory(output); }, "not a run number"));
+    {
+        std::ofstream counter_out(output / "last_run_number");
+        counter_out << "21\n";
+    }
+    CHECK(highest_run_number_on_disk(output) == 21);
+
+    // Programs starting at the same time get different run IDs (flock on the counter).
+    std::vector<std::thread> threads;
+    std::vector<std::vector<int>> numbers(8);
+    for (std::size_t worker = 0; worker < numbers.size(); ++worker) {
+        threads.emplace_back([&, worker] {
+            for (int run = 0; run < 10; ++run) {
+                numbers[worker].push_back(create_run_directory(output).run_number);
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    std::set<int> unique;
+    for (const std::vector<int>& worker_numbers : numbers) {
+        unique.insert(worker_numbers.begin(), worker_numbers.end());
+    }
+    CHECK(unique.size() == 80u && *unique.begin() == 22 && *unique.rbegin() == 101);
+
+    StraxRunInfo info;
+    info.run_id = "000042";
+    info.run_number = 42;
+    info.start_ns = 1795779707385123456LL;
+    info.run_mode = "overlap_on";
+    info.tags = {"bench", "afg"};
+    info.comments = {"self-test"};
+    info.daq = {{"run_directory", "000042"}, {"is_finished", false}};
+    const json open_run = strax_run_metadata(info);
+    CHECK(open_run["name"] == "000042" && open_run["number"] == 42);
+    CHECK(open_run["start"]["$date"] == 1795779707385LL);
+    CHECK(open_run["start_utc"] == "2026-11-27T11:41:47.385123456Z");
+    CHECK(open_run["end"].is_null() && open_run["end_utc"].is_null());
+    CHECK(open_run["mode"] == "overlap_on" && open_run["tags"] == json({"bench", "afg"}));
+    info.end_ns = 1795779717408462786LL;
+    const json finished = strax_run_metadata(info);
+    CHECK(finished["end"]["$date"] == 1795779717409LL);
+    CHECK(finished["end_utc"] == "2026-11-27T11:41:57.408462786Z");
+    CHECK(finished["end_unix_time_ns"] == 1795779717408462786LL);
+    const fs::path written = write_strax_run_metadata(output, info);
+    CHECK(written == output / "run_metadata" / "000042-metadata.json");
+    CHECK(!fs::exists(output / "run_metadata" / "000042-metadata.json.tmp"));
+    std::ifstream written_in(written);
+    CHECK(json::parse(written_in) == finished);
 }
 
 void test_chunks() {
@@ -936,6 +1040,375 @@ void test_chunk_limits() {
     }
 }
 
+ChannelWaveform make_waveform(uint16_t board, int16_t channel, int64_t time_ns,
+                              uint32_t sample_count, uint32_t counter) {
+    ChannelWaveform waveform;
+    waveform.board_index = board;
+    waveform.global_channel = channel;
+    waveform.board_channel = static_cast<uint16_t>(channel % 16);
+    waveform.event_counter = counter;
+    waveform.trigger_time_ticks = static_cast<uint64_t>(time_ns / 8);
+    waveform.time_ns = time_ns;
+    for (uint32_t index = 0; index < sample_count; ++index) {
+        waveform.samples.push_back(static_cast<int16_t>(channel * 100 + index));
+    }
+    return waveform;
+}
+
+bool same_waveform(const ChannelWaveform& left, const ChannelWaveform& right) {
+    return left.board_index == right.board_index && left.global_channel == right.global_channel &&
+           left.board_channel == right.board_channel &&
+           left.event_counter == right.event_counter &&
+           left.trigger_time_ticks == right.trigger_time_ticks &&
+           left.time_ns == right.time_ns && left.n_events == right.n_events &&
+           left.samples == right.samples;
+}
+
+void test_icx3(const fs::path& dir) {
+    ChannelWaveform waveform = make_waveform(3, 215, 1795779707385123456LL, 5, 42);
+    waveform.samples = {-8192, -1, 0, 1, 16383};
+    waveform.n_events = 2;
+    const std::string bytes = encode_icx3(waveform);
+    CHECK(bytes.size() == 40u + 10u && icx3_bytes(waveform) == bytes.size());
+    CHECK(bytes.compare(0, 4, "ICX3") == 0);
+    CHECK(static_cast<uint8_t>(bytes[4]) == 40u && bytes[5] == 0);
+    CHECK(static_cast<uint8_t>(bytes[8]) == 215u);
+    CHECK(static_cast<uint8_t>(bytes[32]) == 5u && static_cast<uint8_t>(bytes[36]) == 2u);
+    const std::vector<ChannelWaveform> back = decode_icx3(bytes);
+    CHECK(back.size() == 1u && same_waveform(back[0], waveform));
+    CHECK(waveform_end_ns(waveform) == waveform.time_ns + 10);
+
+    CHECK(throws_with([&] { decode_icx3(bytes.substr(0, 39)); }, "truncated ICX3 header"));
+    CHECK(throws_with([&] { decode_icx3(bytes.substr(0, 49)); }, "truncated ICX3 samples"));
+    CHECK(throws_with([&] { decode_icx3("ICX2" + bytes.substr(4)); }, "no ICX3 magic"));
+    std::string longer_header = bytes.substr(0, 40) + "abcd" + bytes.substr(40);
+    longer_header[4] = 44;
+    CHECK(decode_icx3(longer_header).size() == 1u && decode_icx3(longer_header)[0].samples ==
+                                                         waveform.samples);
+    ChannelWaveform empty = waveform;
+    empty.samples.clear();
+    CHECK(throws_with([&] { encode_icx3(empty); }, "needs 1..2^32-1 samples"));
+
+    std::mt19937 generator(20261127u);
+    std::uniform_int_distribution<int> any_sample(-32768, 32767);
+    std::vector<ChannelWaveform> written;
+    std::string file_bytes;
+    for (int trial = 0; trial < 300; ++trial) {
+        ChannelWaveform random_waveform = make_waveform(
+            static_cast<uint16_t>(generator() % 8u), static_cast<int16_t>(generator() % 32768u),
+            static_cast<int64_t>(generator()) * 1000003LL, 1u + generator() % 300u, generator());
+        random_waveform.n_events = 1u + generator() % 4u;
+        for (int16_t& sample : random_waveform.samples) {
+            sample = static_cast<int16_t>(any_sample(generator));
+        }
+        file_bytes += encode_icx3(random_waveform);
+        written.push_back(random_waveform);
+    }
+    const std::vector<ChannelWaveform> decoded = decode_icx3(file_bytes);
+    CHECK(decoded.size() == written.size());
+    for (std::size_t index = 0; index < decoded.size() && index < written.size(); ++index) {
+        CHECK(same_waveform(decoded[index], written[index]));
+    }
+
+    const fs::path run = dir / "icx3-run";
+    fs::remove_all(run);
+    fs::create_directories(run);
+    {
+        Icx3ChunkWriter writer(run);
+        writer.write(written[0], false);
+        writer.write(written[1], false);
+        CHECK(fs::exists(run / "wf_00000.bin.tmp") && !fs::exists(run / "wf_00000.bin"));
+        writer.write(written[2], true);
+        CHECK(fs::exists(run / "wf_00000.bin") && !fs::exists(run / "wf_00000.bin.tmp"));
+        CHECK(fs::exists(run / "wf_00001.bin.tmp"));
+        CHECK(writer.waveforms_written() == 3u && writer.filenames().size() == 2u);
+    }
+    CHECK(fs::exists(run / "wf_00001.bin") && !fs::exists(run / "wf_00001.bin.tmp"));
+    const std::vector<ChannelWaveform> first_file = read_icx3_file(run / "wf_00000.bin");
+    CHECK(first_file.size() == 2u && same_waveform(first_file[1], written[1]));
+    CHECK(read_icx3_file(run / "wf_00001.bin").size() == 1u);
+}
+
+BoardEvent make_event(uint32_t counter, int64_t start_ns, uint32_t sample_count,
+                      const std::vector<int16_t>& global_channels) {
+    BoardEvent event;
+    event.event_counter = counter;
+    event.trigger_time_ticks = static_cast<uint64_t>(start_ns / 8);
+    event.start_ns = start_ns;
+    for (const int16_t channel : global_channels) {
+        ChannelSamples samples;
+        samples.board_channel = static_cast<uint16_t>(channel % 16);
+        samples.global_channel = channel;
+        for (uint32_t index = 0; index < sample_count; ++index) {
+            samples.samples.push_back(static_cast<int16_t>((counter % 1000u) * 10u + index % 10u));
+        }
+        event.channels.push_back(samples);
+    }
+    return event;
+}
+
+bool is_time_ordered(const std::vector<ChannelWaveform>& waveforms) {
+    for (std::size_t index = 1; index < waveforms.size(); ++index) {
+        const ChannelWaveform& previous = waveforms[index - 1];
+        const ChannelWaveform& current = waveforms[index];
+        if (current.time_ns < previous.time_ns ||
+            (current.time_ns == previous.time_ns &&
+             current.global_channel <= previous.global_channel)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void test_waveform_merger() {
+    // One board, two separate events: nothing is released before the board is read past them.
+    {
+        WaveformMerger merger(1);
+        merger.add_event(0, make_event(0, 1000, 100, {0, 1}));
+        merger.add_event(0, make_event(1, 5000, 100, {0, 1}));
+        const std::vector<ChannelWaveform> first = merger.take_ready();
+        CHECK(first.size() == 2u && first[0].global_channel == 0 && first[1].global_channel == 1);
+        CHECK(first.size() == 2u && first[0].time_ns == 1000 && first[0].samples.size() == 100u);
+        CHECK(merger.take_ready().empty());
+        merger.mark_read_until(0, 5201);
+        const std::vector<ChannelWaveform> second = merger.take_ready();
+        CHECK(second.size() == 2u && second[0].time_ns == 5000);
+        CHECK(merger.waveforms_held() == 0u);
+    }
+    // Overlapping trigger: the short event starts where the full one ends and is joined.
+    {
+        WaveformMerger merger(1);
+        merger.add_event(0, make_event(7, 1000, 2500, {3}));
+        merger.add_event(0, make_event(8, 6000, 1000, {3}));
+        merger.mark_read_until(0, 8000);
+        CHECK(merger.take_ready().empty());
+        merger.mark_read_until(0, 8001);
+        const std::vector<ChannelWaveform> joined = merger.take_ready();
+        CHECK(joined.size() == 1u);
+        if (joined.size() == 1u) {
+            CHECK(joined[0].samples.size() == 3500u && joined[0].n_events == 2u);
+            CHECK(joined[0].event_counter == 7u && joined[0].time_ns == 1000);
+            CHECK(joined[0].samples.size() > 2500u &&
+                  joined[0].samples[2500] == static_cast<int16_t>(80));
+        }
+        CHECK(merger.events_added() == 2u && merger.events_joined() == 1u);
+    }
+    // A gap of one sample is not joined.
+    {
+        WaveformMerger merger(1);
+        merger.add_event(0, make_event(0, 1000, 10, {0}));
+        merger.add_event(0, make_event(1, 1022, 10, {0}));
+        const std::vector<ChannelWaveform> all = merger.take_all();
+        CHECK(all.size() == 2u && all[0].n_events == 1u && all[1].n_events == 1u);
+    }
+    // Two boards: a lagging board holds back the other board's later waveforms.
+    {
+        WaveformMerger merger(2);
+        merger.add_event(0, make_event(0, 1000, 10, {0}));
+        merger.add_event(0, make_event(1, 9000, 10, {0}));
+        merger.mark_read_until(0, 20000);
+        CHECK(merger.take_ready().empty());
+        merger.add_event(1, make_event(0, 1004, 10, {16}));
+        merger.mark_read_until(1, 3000);
+        const std::vector<ChannelWaveform> ready = merger.take_ready();
+        CHECK(ready.size() == 2u && ready[0].global_channel == 0 && ready[1].global_channel == 16);
+        merger.mark_read_until(1, 20000);
+        const std::vector<ChannelWaveform> rest = merger.take_ready();
+        CHECK(rest.size() == 1u && rest[0].time_ns == 9000);
+    }
+    // Same start time on two boards: ordered by global channel.
+    {
+        WaveformMerger merger(2);
+        merger.add_event(1, make_event(0, 1000, 10, {20, 21}));
+        merger.add_event(0, make_event(0, 1000, 10, {2, 3}));
+        const std::vector<ChannelWaveform> all = merger.take_all();
+        CHECK(all.size() == 4u && is_time_ordered(all) && all[0].global_channel == 2);
+    }
+    {
+        WaveformMerger merger(1);
+        merger.add_event(0, make_event(0, 5000, 10, {0}));
+        CHECK(throws_with([&] { merger.add_event(0, make_event(1, 4000, 10, {0})); },
+                          "starts before the previous event"));
+        CHECK(throws_with([&] { merger.add_event(0, BoardEvent{}); }, "event without channels"));
+        CHECK(throws_with([] { WaveformMerger none(0); }, "at least one board"));
+    }
+
+    // Random runs: boards with gaps and chains of overlapping events, read in random polls.
+    // The released stream must be sorted and equal to the events joined offline.
+    std::mt19937 generator(20261127u);
+    for (int trial = 0; trial < 300; ++trial) {
+        const int board_count = 1 + static_cast<int>(generator() % 5u);
+        std::vector<std::vector<BoardEvent>> events(static_cast<std::size_t>(board_count));
+        std::vector<ChannelWaveform> expected;
+        int64_t run_end_ns = 0;
+        for (int board = 0; board < board_count; ++board) {
+            const int16_t first_channel = static_cast<int16_t>(16 * board);
+            const std::vector<int16_t> channels = {first_channel,
+                                                   static_cast<int16_t>(first_channel + 5)};
+            int64_t start_ns = 1000 + static_cast<int64_t>(generator() % 5000u);
+            uint32_t counter = 0;
+            const int event_count = static_cast<int>(generator() % 40u);
+            std::vector<ChannelWaveform> open;
+            for (int index = 0; index < event_count; ++index) {
+                const bool is_overlap = index > 0 && generator() % 3u == 0u;
+                const uint32_t sample_count = is_overlap ? 1u + generator() % 50u : 100u;
+                if (!is_overlap && index > 0) {
+                    start_ns += 2 + 2 * static_cast<int64_t>(generator() % 2000u);
+                }
+                const BoardEvent event = make_event(counter, start_ns, sample_count, channels);
+                if (is_overlap) {
+                    for (std::size_t channel = 0; channel < open.size(); ++channel) {
+                        open[channel].samples.insert(open[channel].samples.end(),
+                                                     event.channels[channel].samples.begin(),
+                                                     event.channels[channel].samples.end());
+                        ++open[channel].n_events;
+                    }
+                } else {
+                    expected.insert(expected.end(), open.begin(), open.end());
+                    open.clear();
+                    for (const ChannelSamples& samples : event.channels) {
+                        ChannelWaveform waveform;
+                        waveform.board_index = static_cast<uint16_t>(board);
+                        waveform.global_channel = samples.global_channel;
+                        waveform.board_channel = samples.board_channel;
+                        waveform.event_counter = counter;
+                        waveform.trigger_time_ticks = event.trigger_time_ticks;
+                        waveform.time_ns = start_ns;
+                        waveform.samples = samples.samples;
+                        open.push_back(waveform);
+                    }
+                }
+                events[static_cast<std::size_t>(board)].push_back(event);
+                start_ns = event_end_ns(event);
+                run_end_ns = std::max(run_end_ns, start_ns);
+                ++counter;
+            }
+            expected.insert(expected.end(), open.begin(), open.end());
+        }
+        std::sort(expected.begin(), expected.end(), [](const auto& left, const auto& right) {
+            return left.time_ns != right.time_ns ? left.time_ns < right.time_ns
+                                                 : left.global_channel < right.global_channel;
+        });
+
+        WaveformMerger merger(board_count);
+        std::vector<std::size_t> next(static_cast<std::size_t>(board_count), 0u);
+        std::vector<ChannelWaveform> released;
+        for (int64_t poll_ns = 0; poll_ns <= run_end_ns + 20000;
+             poll_ns += 1 + static_cast<int64_t>(generator() % 20000u)) {
+            for (int board = 0; board < board_count; ++board) {
+                if (generator() % 4u == 0u) {
+                    continue;
+                }
+                const auto& board_events = events[static_cast<std::size_t>(board)];
+                std::size_t& position = next[static_cast<std::size_t>(board)];
+                while (position < board_events.size() &&
+                       board_events[position].start_ns < poll_ns) {
+                    merger.add_event(board, board_events[position]);
+                    ++position;
+                }
+                merger.mark_read_until(board, poll_ns);
+            }
+            const std::vector<ChannelWaveform> ready = merger.take_ready();
+            released.insert(released.end(), ready.begin(), ready.end());
+        }
+        for (int board = 0; board < board_count; ++board) {
+            const auto& board_events = events[static_cast<std::size_t>(board)];
+            for (std::size_t position = next[static_cast<std::size_t>(board)];
+                 position < board_events.size(); ++position) {
+                merger.add_event(board, board_events[position]);
+            }
+        }
+        const std::vector<ChannelWaveform> rest = merger.take_all();
+        released.insert(released.end(), rest.begin(), rest.end());
+        CHECK(is_time_ordered(released));
+        CHECK(released.size() == expected.size());
+        bool is_equal = released.size() == expected.size();
+        for (std::size_t index = 0; is_equal && index < released.size(); ++index) {
+            is_equal = same_waveform(released[index], expected[index]);
+        }
+        CHECK(is_equal);
+    }
+}
+
+void test_chunk_cutter() {
+    const ChunkLimits limits = chunk_limits(1e-6, 500.0);  // 1000 ns per chunk
+    // Overlapping waveforms of two channels: no boundary until a gap of all channels.
+    {
+        ChunkCutter cutter(0, 100, limits, 2);
+        CHECK(cutter.add(make_waveform(0, 0, 200, 100, 0)));
+        CHECK(!cutter.add(make_waveform(1, 16, 300, 1000, 0)));
+        CHECK(!cutter.add(make_waveform(0, 0, 1500, 100, 1)));
+        CHECK(cutter.add(make_waveform(0, 0, 2300, 100, 2)));
+        CHECK(cutter.close(5000) == 5000);
+        const auto& chunks = cutter.chunks();
+        CHECK(chunks.size() == 2u);
+        CHECK(chunks[0].start_ns == 100 && *chunks[0].end_ns == 2300);
+        CHECK(chunks[1].start_ns == 2300 && *chunks[1].end_ns == 5000);
+        CHECK(chunks[0].n_waveforms == 3u && chunks[0].last_waveform_end_ns == 2300);
+        CHECK(chunks[0].first_event_counter[0] == 0u && chunks[0].last_event_counter[0] == 1u);
+        CHECK(chunks[0].first_event_counter[1] == 0u && !chunks[1].first_event_counter[1]);
+    }
+    // Joined waveforms count all their events; close_at_last_waveform ignores the stop time.
+    {
+        ChunkCutter cutter(0, 0, limits, 1);
+        ChannelWaveform joined = make_waveform(0, 0, 50, 300, 10);
+        joined.n_events = 3;
+        cutter.add(joined);
+        CHECK(cutter.chunks()[0].last_event_counter[0] == 12u);
+        CHECK(cutter.close_at_last_waveform(99999) == 650);
+        ChunkCutter empty(0, 0, limits, 1);
+        CHECK(empty.close_at_last_waveform(7) == 7 && empty.chunks().empty());
+    }
+    // The first chunk never starts before the run start.
+    {
+        ChunkCutter cutter(1000, 1005, limits, 1);
+        cutter.add(make_waveform(0, 0, 400, 10, 0));
+        CHECK(cutter.chunks()[0].start_ns == 1000);
+    }
+
+    // Random streams: chunks without gaps, every waveform inside its chunk, boundaries only
+    // in gaps of all channels, and no chunk is cut later than needed by more than one gap.
+    std::mt19937 generator(20261127u);
+    for (int trial = 0; trial < 300; ++trial) {
+        const ChunkLimits random_limits =
+            chunk_limits(1e-6 * (1 + generator() % 20u), 0.001 * (1 + generator() % 50u));
+        std::vector<ChannelWaveform> stream;
+        int64_t time_ns = 10000;
+        for (int index = 0; index < 400; ++index) {
+            time_ns += 2 * static_cast<int64_t>(generator() % 400u);
+            stream.push_back(make_waveform(static_cast<uint16_t>(generator() % 3u),
+                                           static_cast<int16_t>(index % 7), time_ns,
+                                           1u + generator() % 300u, static_cast<uint32_t>(index)));
+        }
+        ChunkCutter cutter(0, 10000, random_limits, 3);
+        std::vector<int> chunk_of;
+        int current = -1;
+        for (const ChannelWaveform& waveform : stream) {
+            if (cutter.add(waveform)) {
+                ++current;
+            }
+            chunk_of.push_back(current);
+        }
+        cutter.close(time_ns + 1000);
+        const auto& chunks = cutter.chunks();
+        CHECK(static_cast<int>(chunks.size()) == current + 1);
+        uint64_t total = 0;
+        for (std::size_t index = 0; index < chunks.size(); ++index) {
+            total += chunks[index].n_waveforms;
+            CHECK(chunks[index].end_ns.has_value());
+            if (index + 1 < chunks.size()) {
+                CHECK(*chunks[index].end_ns == chunks[index + 1].start_ns);
+            }
+        }
+        CHECK(total == stream.size());
+        for (std::size_t index = 0; index < stream.size(); ++index) {
+            const ChunkRecord& chunk = chunks[static_cast<std::size_t>(chunk_of[index])];
+            CHECK(stream[index].time_ns >= chunk.start_ns);
+            CHECK(waveform_end_ns(stream[index]) <= *chunk.end_ns);
+        }
+    }
+}
+
 void test_duration_option(const fs::path& dir) {
     CHECK(parse_duration_option("10") == 10.0);
     CHECK(parse_duration_option("2.5") == 2.5);
@@ -1234,6 +1707,7 @@ int run_self_test(const std::string& config_path) {
     fs::create_directories(dir);
     try {
         test_utc_stamp();
+        test_run_registry(dir);
         test_buffers();
         test_chunks();
         test_common_sample_count();
@@ -1247,6 +1721,9 @@ int run_self_test(const std::string& config_path) {
         test_duration_option(dir);
         test_channel_map_and_run_info(dir);
         test_chunk_limits();
+        test_icx3(dir);
+        test_waveform_merger();
+        test_chunk_cutter();
         test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {

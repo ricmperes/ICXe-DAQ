@@ -142,10 +142,10 @@ Written at the start of the run (with `end` = `null`) and rewritten at the end. 
   "number": 42,
   "start": {"$date": 1795779707385},
   "end": {"$date": 1795779717409},
-  "start_utc": "2026-11-27T11:41:47.385Z",
-  "end_utc": "2026-11-27T11:41:57.409Z",
-  "start_unix_time_ns": 1795779707385000000,
-  "end_unix_time_ns": 1795779717409000000,
+  "start_utc": "2026-11-27T11:41:47.385123456Z",
+  "end_utc": "2026-11-27T11:41:57.408462786Z",
+  "start_unix_time_ns": 1795779707385123456,
+  "end_unix_time_ns": 1795779717408462786,
   "mode": "tpc_external_trigger",
   "tags": ["bench", "overlap_test"],
   "comments": ["AFG bursts of 2 pulses, 2 us apart"],
@@ -163,7 +163,7 @@ Written at the start of the run (with `end` = `null`) and rewritten at the end. 
 * `tags`: new config key `tags` (list of strings, may be `[]`), copied as is. A tag must not contain a comma: `select_runs` joins the tags of a run with commas before matching.
 * `comments`: new config key `comments` (list of strings, may be `[]`), copied as is.
 * Run mode, tags and comments all come from the config file (review 2026-11-27), so the `config.json` copy in the run directory documents them too. Tags and comments added after the run (e.g. "bad", or a shift note) are edits of the run-metadata file on the analysis side; the DAQ does not touch it after the run.
-* `start` / `end`: run start and end in ms, rounded down / up, so they cover all chunks. strax needs them in the `{"$date": <ms>}` form; the same instants are also written as readable UTC strings (`start_utc`, `end_utc`) and in Unix ns (`start_unix_time_ns`, `end_unix_time_ns`).
+* `start` / `end`: run start and end in ms, rounded down / up, so they cover all chunks. strax needs them in the `{"$date": <ms>}` form; the exact run start and end are also written as readable UTC strings (`start_utc`, `end_utc`, to the ns) and in Unix ns (`start_unix_time_ns`, `end_unix_time_ns`).
 
 Rule for both metadata files (review 2026-11-27): every start or end time is written twice, as a UTC string (ISO 8601 with `Z`; to the ns where the value has ns precision, e.g. `"2026-11-27T11:41:47.385123456Z"`) and as an integer `*_unix_time_ns`. Today's `started_utc` (whole seconds) becomes a full-precision string as well.
 * `daq`: a small summary for `select_runs` and for finding the run directory. The full detail stays in `<run>/metadata.json`.

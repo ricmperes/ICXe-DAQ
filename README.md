@@ -131,7 +131,7 @@ The nominal DAC for a target percent, used as the starting map, is `round((100 -
 ## Files
 
 ```text
-data/<run_mode>_<UTC>/
+data/<run_id>/
   config.json
   metadata.json
   wf_00000.bin

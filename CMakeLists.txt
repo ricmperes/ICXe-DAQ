@@ -16,6 +16,9 @@ add_executable(icxe-daq
   src/buffers.cpp
   src/chunks.cpp
   src/coincidence.cpp
+  src/icx3.cpp
+  src/merge.cpp
+  src/run_registry.cpp
   src/writer.cpp
   src/digitizer.cpp
   src/self_test.cpp
@@ -26,11 +29,13 @@ target_include_directories(icxe-daq PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
+find_package(Threads REQUIRED)
 find_library(CAENDIGITIZER_LIB CAENDigitizer REQUIRED)
 find_library(CAENCOMM_LIB CAENComm REQUIRED)
 find_library(CAENVME_LIB CAENVME REQUIRED)
 
 target_link_libraries(icxe-daq PRIVATE
+  Threads::Threads
   ${CAENDIGITIZER_LIB}
   ${CAENCOMM_LIB}
   ${CAENVME_LIB}

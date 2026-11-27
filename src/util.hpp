@@ -3,6 +3,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <sstream>
 #include <string>
@@ -24,7 +25,7 @@ inline std::string utc_now_iso() {
     return buf;
 }
 
-// One wall-clock reading as both an ISO string (whole seconds) and Unix time in ns.
+// One wall-clock reading as both a UTC string (to the ns) and Unix time in ns.
 struct UtcStamp {
     std::string iso;
     int64_t unix_ns = 0;
@@ -36,15 +37,22 @@ inline int64_t unix_now_ns() {
         .count();
 }
 
-// ISO string (whole seconds, truncated) for a Unix time in ns.
-inline UtcStamp utc_stamp_from_ns(int64_t ns) {
-    // Floor to whole seconds (ns is positive after 1970, so division floors).
+// UTC text of a Unix time in ns, to the ns: "2026-11-27T11:41:47.385123456Z" (ISO 8601).
+// Readable by numpy.datetime64 and pandas without loss. Needs ns >= 0 (after 1970).
+inline std::string utc_text_from_ns(int64_t ns) {
     const std::time_t t = static_cast<std::time_t>(ns / 1000000000LL);
+    const long fraction = static_cast<long>(ns % 1000000000LL);
     std::tm tm{};
     gmtime_r(&t, &tm);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return UtcStamp{buf, ns};
+    char seconds[32];
+    std::strftime(seconds, sizeof(seconds), "%Y-%m-%dT%H:%M:%S", &tm);
+    char text[48];
+    std::snprintf(text, sizeof(text), "%s.%09ldZ", seconds, fraction);
+    return text;
+}
+
+inline UtcStamp utc_stamp_from_ns(int64_t ns) {
+    return UtcStamp{utc_text_from_ns(ns), ns};
 }
 
 inline UtcStamp utc_now_stamp() {

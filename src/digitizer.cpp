@@ -2,6 +2,7 @@
 
 #include "board_status.hpp"
 #include "chunks.hpp"
+#include "run_registry.hpp"
 #include "util.hpp"
 #include "writer.hpp"
 
@@ -293,11 +294,14 @@ json chunks_json(const ChunkTracker& tracker) {
                    {"n_events", c.n_events},
                    {"first_event_counter", c.first_event_counter},
                    {"last_event_counter", c.last_event_counter},
+                   {"start_utc", utc_text_from_ns(c.start_ns)},
                    {"start_unix_time_ns", c.start_ns},
+                   {"end_utc", nullptr},
                    {"end_unix_time_ns", nullptr},
                    {"first_waveform_start_unix_time_ns", c.first_waveform_start_ns},
                    {"last_waveform_end_unix_time_ns", c.last_waveform_end_ns}};
         if (c.end_ns) {
+            cj["end_utc"] = utc_text_from_ns(*c.end_ns);
             cj["end_unix_time_ns"] = *c.end_ns;
         }
         out.push_back(cj);
@@ -835,7 +839,8 @@ public:
     }
 
     void acquire_run(const std::string& config_path, uint64_t max_events) {
-        const fs::path run_dir = make_run_dir();
+        const RunDirectory run = create_run_directory(cfg_.output_directory);
+        const fs::path run_dir = run.path;
         fs::copy_file(config_path, run_dir / "config.json", fs::copy_options::overwrite_existing);
         WaveformWriter writer(run_dir);
         const ChunkLimits limits = chunk_limits(cfg_.chunk_duration_s, cfg_.chunk_max_mb);
@@ -848,6 +853,20 @@ public:
              cfg_.duration_s_from_command_line ? "command line --duration" : "config duration_s"},
             {"max_events", max_events > 0 ? json(max_events) : json(nullptr)}};
         meta["events_read_after_stop"] = nullptr;
+        meta["run_id"] = run.run_id;
+        meta["run_number"] = run.run_number;
+        StraxRunInfo strax_info = strax_run_info(run, started.unix_ns);
+        write_strax_run_metadata(cfg_.output_directory, strax_info);
+        const auto record_run_end = [&](int64_t end_ns, const std::string& stop_reason) {
+            const UtcStamp ended = utc_stamp_from_ns(end_ns);
+            meta["ended_utc"] = ended.iso;
+            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
+            meta["stop_reason"] = stop_reason;
+            strax_info.end_ns = ended.unix_ns;
+            strax_info.daq["stop_reason"] = stop_reason;
+            strax_info.daq["is_finished"] = true;
+            write_strax_run_metadata(cfg_.output_directory, strax_info);
+        };
         write_metadata(run_dir / "metadata.json", meta);
 
         std::fprintf(stdout, "directory=%s\n", run_dir.string().c_str());
@@ -865,6 +884,7 @@ public:
         TimeTagUnwrapper unwrapper(acq_start_ns_);
         ChunkTracker chunks(started.unix_ns, acq_start_ns_, post_actual_);
         SampleCountSummary sample_counts(record_read_);
+        meta["acquisition_start_utc"] = utc_text_from_ns(acq_start_ns_);
         meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
         const auto update_files = [&] {
             meta["events_written"] = writer.events_written();
@@ -966,10 +986,7 @@ public:
             // and the run ends no earlier than the last chunk.
             const int64_t chunk_end = chunks.close_at_last_waveform(unix_now_ns());
             update_files();
-            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
-            meta["ended_utc"] = ended.iso;
-            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
-            meta["stop_reason"] = "error";
+            record_run_end(std::max(unix_now_ns(), chunk_end), "error");
             write_metadata(run_dir / "metadata.json", meta);
             throw;
         }
@@ -992,10 +1009,7 @@ public:
             writer.flush();
             const int64_t chunk_end = chunks.close_at_last_waveform(stop_ns);
             update_files();
-            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
-            meta["ended_utc"] = ended.iso;
-            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
-            meta["stop_reason"] = "error";
+            record_run_end(std::max(unix_now_ns(), chunk_end), "error");
             write_metadata(run_dir / "metadata.json", meta);
             throw;
         }
@@ -1008,10 +1022,7 @@ public:
         meta["events_read_after_stop"] =
             events_read_after_stop ? json(*events_read_after_stop) : json(nullptr);
         update_files();
-        const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
-        meta["ended_utc"] = ended.iso;
-        meta["ended_utc_unix_time_ns"] = ended.unix_ns;
-        meta["stop_reason"] = stop;
+        record_run_end(std::max(unix_now_ns(), chunk_end), stop);
         meta["board_health"]["end"] = read_health_json_or_null();
         meta["board_health"]["status_checks_during_run"] = status_checks_during_run_;
         meta["board_health"]["problems"] = status_problems_;
@@ -1768,18 +1779,27 @@ private:
         }
     }
 
-    fs::path make_run_dir() const {
-        fs::create_directories(cfg_.output_directory);
-        const std::string stamp = utc_now_compact();
-        fs::path dir = fs::path(cfg_.output_directory) / (cfg_.run_mode + "_" + stamp);
-        int n = 2;
-        while (fs::exists(dir)) {
-            dir = fs::path(cfg_.output_directory) /
-                  (cfg_.run_mode + "_" + stamp + "-" + std::to_string(n));
-            ++n;
+    StraxRunInfo strax_run_info(const RunDirectory& run, int64_t start_ns) const {
+        StraxRunInfo info;
+        info.run_id = run.run_id;
+        info.run_number = run.run_number;
+        info.start_ns = start_ns;
+        info.run_mode = cfg_.run_mode;
+        info.tags = cfg_.tags;
+        info.comments = cfg_.comments;
+        json enabled_channels = json::array();
+        for (const ChannelConfig& channel : cfg_.channels) {
+            if (channel.enabled) {
+                enabled_channels.push_back(channel.global_channel);
+            }
         }
-        fs::create_directories(dir);
-        return dir;
+        info.daq = {{"run_directory", run.run_id},
+                    {"is_finished", false},
+                    {"stop_reason", nullptr},
+                    {"boards", json::array({cfg_.board_name})},
+                    {"channels_enabled", enabled_channels},
+                    {"waveform_format", "ICX2"}};
+        return info;
     }
 
     const ChannelConfig& channel_config_of(int index) const {
@@ -1971,6 +1991,7 @@ private:
         meta["started_utc_unix_time_ns"] = started.unix_ns;
         meta["ended_utc"] = nullptr;
         meta["ended_utc_unix_time_ns"] = nullptr;
+        meta["acquisition_start_utc"] = nullptr;
         meta["acquisition_start_unix_time_ns"] = nullptr;
         meta["events_written"] = 0;
         meta["files"] = json::array();

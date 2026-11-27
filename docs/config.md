@@ -34,7 +34,7 @@ These keys describe the run for the analysis. They do not change anything on the
 
 | Path | Type | Allowed | What it does |
 | --- | --- | --- | --- |
-| `run_mode` | string | 1..64 of letters, digits, `-`, `_` | What kind of run this config makes, e.g. `tpc_external_trigger` or `overlap_on`. Becomes the strax run mode (`st.select_runs(run_mode=...)`). Until the run IDs of 2c.4 exist, it also names the run directory: `<output_directory>/<run_mode>_<UTC start time>`, e.g. `data/four_boards_20261127T101500Z`; if that exists, `-2`, `-3`, … is appended. |
+| `run_mode` | string | 1..64 of letters, digits, `-`, `_` | What kind of run this config makes, e.g. `tpc_external_trigger` or `overlap_on`. Becomes the strax run mode (`st.select_runs(run_mode=...)`). The run folder itself is named by the run ID (`data/000042`, [data_format.md](data_format.md)). |
 | `tags` | list of strings | each non-empty and without commas; `[]` for none | Labels for finding runs later, e.g. `["bench", "afg"]`. Become the strax run tags (`st.select_runs(include_tags=...)`). Commas are not allowed because strax joins the tags of a run with commas before matching. |
 | `comments` | list of strings | each non-empty; `[]` for none | Free text about the run, e.g. `["AFG bursts of 2 pulses, 2 us apart"]`. Copied into the metadata and the strax run comments. Change it in the file before each run if it should describe that run. |
 
@@ -48,7 +48,7 @@ These keys describe the run for the analysis. They do not change anything on the
 
 | Path | Type | Allowed | What it does |
 | --- | --- | --- | --- |
-| `output_directory` | string | non-empty | Folder in which the run directory is created (relative to where the program is started, or absolute). It is created if missing. |
+| `output_directory` | string | non-empty | Folder in which the run directory is created (relative to where the program is started, or absolute). It is created if missing. It also holds the run counter `last_run_number` and the strax run metadata `run_metadata/`, so run IDs count per output directory: a new directory starts again at `000001`. |
 | `duration_s` | number | `>= 0` | Length of the acquisition in seconds, counted from the start of acquisition (the baseline step before it does not count). `0` means no time limit: the run then stops only on `--max-events N` or Ctrl-C / SIGTERM. |
 | `chunk_duration_s` | number | `> 0` | Time span of one waveform file `wf_XXXXX.bin` (one chunk). A new file is started with the first event whose waveform starts this long or longer after the first waveform of the current file, so files close at event boundaries and never split a waveform. The processing (strax) combines chunks when it saves data, so this mainly sets how soon a chunk is complete for online processing; 5 s is a good start. |
 | `chunk_max_mb` | number | `>= 1` | Upper limit for one waveform file in MB (10^6 bytes). A file that would grow beyond it is closed early, at the next event, even if `chunk_duration_s` has not passed. It protects against huge files at high rates (all channels at a high trigger rate can write hundreds of MB per second). 500 is a good start. |

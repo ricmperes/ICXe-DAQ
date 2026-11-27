@@ -5,14 +5,31 @@ Cheat sheet for the directory `icxe-daq run` writes. The layout is `encode_wavef
 ## Run directory
 
 ```text
-<data>/<run_mode>_<YYYYMMDDTHHMMSSZ>/
-  config.json
-  metadata.json
-  wf_00000.bin
-  wf_00001.bin
+<output_directory>/
+  last_run_number             counter of the run IDs
+  run_metadata/
+    000042-metadata.json      strax run metadata of run 000042
+  000042/
+    config.json
+    metadata.json
+    wf_00000.bin
+    wf_00001.bin
 ```
 
-The folder is `<output_directory>/<run_mode>_<UTC>` (run IDs replace this in step 2c.4), UTC as `%Y%m%dT%H%M%SZ`. If that path exists, the name gains `-2`, `-3`, and so on. The example is `data/v1730sb_20261026T143011Z/`.
+**Run ID.** Every run gets the next run number of its output directory, printed with at least 6 digits (`000042`), and its folder is `<output_directory>/<run_id>`. The last used number is in `<output_directory>/last_run_number`; it is read and written under a file lock, so two programs started at the same time get different numbers. The next number is above the counter and above every numeric run folder in the directory, so a deleted counter file does not reuse a number. Numbers are never reused, also not for failed runs. Known limit: a new, empty output directory starts again at `000001`, so a run ID is unique only within its output directory. Runs written before 2026-11-27 have folders named `<name>_<UTC>`, e.g. `data/overlap_on_20261127T093731Z/`.
+
+**strax run metadata.** `run_metadata/<run_id>-metadata.json` is the file strax's `DataDirectory(..., provide_run_metadata=True)` reads, so `st.run_metadata` and `st.select_runs` work on that folder without a run database (checked with strax on 2026-11-27). It is written when the run starts (with `end` `null`) and again when it ends:
+
+| Field | Example | Role |
+| --- | --- | --- |
+| `name`, `number` | `"000042"`, `42` | Run ID and run number. |
+| `start`, `end` | `{"$date": 1795779707385}` | Run start rounded down and run end rounded up to the ms, in the form strax reads as a datetime. They cover every chunk. `end` is `null` while the run is going. |
+| `start_utc`, `end_utc` | `"2026-11-27T11:41:47.385123456Z"` | Exact run start and end as UTC text, to the ns. |
+| `start_unix_time_ns`, `end_unix_time_ns` | `1795779707385123456` | The same instants in Unix ns. |
+| `mode`, `tags`, `comments` | `"overlap_on"`, `["bench"]`, `[]` | Config keys `run_mode`, `tags`, `comments` (plain strings). |
+| `daq` | object | `run_directory` (folder name next to `run_metadata/`), `is_finished`, `stop_reason` (`null` while running), `boards` (names), `channels_enabled` (global channel numbers), `waveform_format`. |
+
+The DAQ does not touch this file after the run; tags or comments added later (e.g. "bad") are edits on the analysis side.
 
 | File | Contents |
 | --- | --- |
@@ -117,13 +134,15 @@ The event header already carries the mask and the sample count. These metadata f
 
 | Field | Example | Role |
 | --- | --- | --- |
-| `started_utc` | `"2026-11-02T13:21:08Z"` | Run start, UTC, whole seconds. |
+| `run_id`, `run_number` | `"000042"`, `42` | Run ID (folder name) and run number. |
+| `started_utc` | `"2026-11-02T13:21:08.123456789Z"` | Run start, UTC, to the ns. |
 | `started_utc_unix_time_ns` | `1793625668123456789` | Same instant as `started_utc`, Unix time in nanoseconds (integer). |
+| `acquisition_start_utc` | `"2026-11-02T13:21:08.131000000Z"` | `acquisition_start_unix_time_ns` as UTC text. |
 | `acquisition_start_unix_time_ns` | `1793625668131000000` | PC time just before `CAEN_DGTZ_SWStartAcquisition`. Origin of `trigger_time_ticks`. `null` until acquisition starts. |
-| `ended_utc` | `"2026-11-02T13:25:41Z"` | Run end, UTC, whole seconds. `null` while the run is in progress. |
+| `ended_utc` | `"2026-11-02T13:25:41.987654321Z"` | Run end, UTC, to the ns. `null` while the run is in progress. |
 | `ended_utc_unix_time_ns` | `1793625941987654321` | Same instant as `ended_utc`, Unix time in nanoseconds. `null` while the run is in progress. |
 
-Each string and its `_unix_time_ns` partner describe the same instant; the string is that value truncated to the second. The start is taken when the run directory is created, a few milliseconds before acquisition starts. The end is taken after acquisition stops and the last waveform file is flushed. If the last chunk ends later than that (board clock running fast against the PC clock), the run end is moved to the end of the last chunk, so `ended_utc_unix_time_ns` is never earlier than any chunk.
+Each string and its `_unix_time_ns` partner describe the same instant, to the ns (ISO 8601, readable by `numpy.datetime64` and pandas). Runs written before 2026-11-27 have strings in whole seconds. The start is taken when the run directory is created, a few milliseconds before acquisition starts. The end is taken after acquisition stops and the last waveform file is flushed. If the last chunk ends later than that (board clock running fast against the PC clock), the run end is moved to the end of the last chunk, so `ended_utc_unix_time_ns` is never earlier than any chunk.
 
 The clock is the PC wall clock, so its accuracy is that of the host time sync (NTP, typically about a millisecond), not nanoseconds. The board resets its trigger time tag when acquisition actually starts, which is shortly after `acquisition_start_unix_time_ns`, so absolute event times can be early by that delay (milliseconds at most).
 
@@ -154,7 +173,9 @@ Each `wf_NNNNN.bin` is one chunk. `chunks` lists them in order:
     "n_events": 1000,
     "first_event_counter": 0,
     "last_event_counter": 999,
+    "start_utc": "2026-11-02T13:21:08.131000000Z",
     "start_unix_time_ns": 1793625668131000000,
+    "end_utc": "2026-11-02T13:21:10.512345678Z",
     "end_unix_time_ns": 1793625670512345678,
     "first_waveform_start_unix_time_ns": 1793625668131200000,
     "last_waveform_end_unix_time_ns": 1793625670511000000
