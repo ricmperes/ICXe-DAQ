@@ -26,6 +26,7 @@ using json = nlohmann::json;
 namespace {
 
 constexpr double kStatusCheckPeriodS = 1.0;
+constexpr double kDrainTimeoutS = 10.0;
 
 volatile std::sig_atomic_t g_stop_signal = 0;
 
@@ -247,6 +248,7 @@ json sample_counts_json(const SampleCountSummary& summary) {
 json acquisition_status_json(const AcquisitionStatus& status) {
     return {{"raw", hex32(status.raw)},
             {"is_running", status.is_running},
+            {"has_event_ready", status.has_event_ready},
             {"is_memory_full", status.is_memory_full},
             {"is_clock_external", status.is_clock_external},
             {"is_pll_lock_kept", status.is_pll_lock_kept},
@@ -350,9 +352,6 @@ public:
         uint32_t ne = 0;
         check(CAEN_DGTZ_GetNumEvents(handle_, buf_, got, &ne), "GetNumEvents");
         for (uint32_t i = 0; i < ne; ++i) {
-            if (g_stop_signal) {
-                break;
-            }
             CAEN_DGTZ_EventInfo_t info{};
             char* ptr = nullptr;
             check(CAEN_DGTZ_GetEventInfo(handle_, buf_, got, static_cast<int32_t>(i), &info, &ptr),
@@ -847,6 +846,7 @@ public:
             {"duration_s_source",
              cfg_.duration_s_from_command_line ? "command line --duration" : "config duration_s"},
             {"max_events", max_events > 0 ? json(max_events) : json(nullptr)}};
+        meta["events_read_after_stop"] = nullptr;
         write_metadata(run_dir / "metadata.json", meta);
 
         std::fprintf(stdout, "directory=%s\n", run_dir.string().c_str());
@@ -872,6 +872,28 @@ public:
             meta["sample_counts"] = sample_counts_json(sample_counts);
         };
 
+        const auto write_event = [&](const CAEN_DGTZ_EventInfo_t& info,
+                                     const CAEN_DGTZ_UINT16_EVENT_t* ev) {
+            if (max_events > 0 && writer.events_written() >= max_events) {
+                return false;
+            }
+            // PC time after ReadData returned: the event happened before it.
+            const int64_t read_ns = unix_now_ns();
+            WaveformEvent event;
+            event.event_counter = info.EventCounter;
+            event.trigger_time_tag = info.TriggerTimeTag;
+            event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
+            event.channel_mask = cfg_.channel_mask;
+            event.sample_count = common_sample_count(ev->ChSize, cfg_.channel_mask);
+            event.samples = extract_enabled(ev, event.sample_count);
+            writer.write_event(event);
+            chunks.add_event(writer.file_index(), writer.filenames().back(),
+                             event.event_counter, event.trigger_time_ticks,
+                             event.sample_count);
+            sample_counts.add(event.sample_count);
+            return !(max_events > 0 && writer.events_written() >= max_events);
+        };
+
         timespec next_trigger = start;
         const bool rate = cfg_.trigger == TriggerType::Rate;
         const int64_t period_ns = rate ? std::llround(1e9 / cfg_.rate_hz) : 0;
@@ -892,27 +914,7 @@ public:
                         add_ns(next_trigger, period_ns);
                     }
                 }
-                const int n = readout_->poll([&](const CAEN_DGTZ_EventInfo_t& info,
-                                                 const CAEN_DGTZ_UINT16_EVENT_t* ev) {
-                    if (max_events > 0 && writer.events_written() >= max_events) {
-                        return false;
-                    }
-                    // PC time after ReadData returned: the event happened before it.
-                    const int64_t read_ns = unix_now_ns();
-                    WaveformEvent event;
-                    event.event_counter = info.EventCounter;
-                    event.trigger_time_tag = info.TriggerTimeTag;
-                    event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
-                    event.channel_mask = cfg_.channel_mask;
-                    event.sample_count = common_sample_count(ev->ChSize, cfg_.channel_mask);
-                    event.samples = extract_enabled(ev, event.sample_count);
-                    writer.write_event(event);
-                    chunks.add_event(writer.file_index(), writer.filenames().back(),
-                                     event.event_counter, event.trigger_time_ticks,
-                                     event.sample_count);
-                    sample_counts.add(event.sample_count);
-                    return !(max_events > 0 && writer.events_written() >= max_events);
-                });
+                const int n = readout_->poll(write_event);
                 if (max_events > 0 && writer.events_written() >= max_events) {
                     stop = "max_events";
                     break;
@@ -953,9 +955,9 @@ public:
             }
         } catch (...) {
             writer.flush();
-            // The last chunk ends no earlier than its last waveform, and the run
-            // ends no earlier than the last chunk.
-            const int64_t chunk_end = chunks.close(unix_now_ns());
+            // Events still in the board are lost: the last chunk ends at its last waveform,
+            // and the run ends no earlier than the last chunk.
+            const int64_t chunk_end = chunks.close_at_last_waveform(unix_now_ns());
             update_files();
             const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
             meta["ended_utc"] = ended.iso;
@@ -965,12 +967,39 @@ public:
             throw;
         }
 
+        // The board keeps the events it took before the stop in its memory. Unless the
+        // run stopped on --max-events (later events are dropped on purpose), they are read
+        // and written, so the last chunk holds every event up to the stop.
+        const bool is_drained = stop != "max_events";
+        const int64_t stop_ns = unix_now_ns();
         if (acq_on_) {
             check(CAEN_DGTZ_SWStopAcquisition(handle_), "SWStopAcquisition");
             acq_on_ = false;
         }
+        std::optional<uint64_t> events_read_after_stop;
+        try {
+            if (is_drained) {
+                events_read_after_stop = drain_board(write_event);
+            }
+        } catch (...) {
+            writer.flush();
+            const int64_t chunk_end = chunks.close_at_last_waveform(stop_ns);
+            update_files();
+            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
+            meta["ended_utc"] = ended.iso;
+            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
+            meta["stop_reason"] = "error";
+            write_metadata(run_dir / "metadata.json", meta);
+            throw;
+        }
         writer.flush();
-        const int64_t chunk_end = chunks.close(unix_now_ns());
+        const bool has_every_event_until_stop =
+            is_drained && !(max_events > 0 && writer.events_written() >= max_events);
+        const int64_t chunk_end = has_every_event_until_stop
+                                      ? chunks.close(stop_ns)
+                                      : chunks.close_at_last_waveform(stop_ns);
+        meta["events_read_after_stop"] =
+            events_read_after_stop ? json(*events_read_after_stop) : json(nullptr);
         update_files();
         const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
         meta["ended_utc"] = ended.iso;
@@ -1082,6 +1111,27 @@ public:
     }
 
 private:
+    // Reads the events left in the board memory after SWStopAcquisition until ReadData
+    // returns nothing. Returns the number of events read.
+    template <class F>
+    uint64_t drain_board(F&& write_event) {
+        const timespec drain_start = mono_now();
+        uint64_t events_read = 0;
+        while (true) {
+            const int events_in_block = readout_->poll(write_event);
+            if (events_in_block == 0) {
+                return events_read;
+            }
+            events_read += static_cast<uint64_t>(events_in_block);
+            if (elapsed_s(mono_now(), drain_start) > kDrainTimeoutS) {
+                throw std::runtime_error("board memory not empty " +
+                                         std::to_string(kDrainTimeoutS) +
+                                         " s after the stop (" + std::to_string(events_read) +
+                                         " events read)");
+            }
+        }
+    }
+
     AcquisitionStatus read_status() {
         uint32_t raw = 0;
         check(CAEN_DGTZ_ReadRegister(handle_, 0x8104, &raw), "read status 0x8104");

@@ -66,8 +66,13 @@ public:
     void add_event(int file_index, const std::string& file, uint32_t event_counter,
                    uint64_t ticks, uint32_t sample_count);
 
-    // Ends the last chunk and returns its end (or stop_ns when there is no chunk).
+    // Ends the last chunk and returns its end (or stop_ns when there is no chunk). Only
+    // valid when every event the board took before stop_ns has been added.
     int64_t close(int64_t stop_ns);
+
+    // Ends the last chunk at its last waveform, for runs whose later events were not
+    // written (--max-events, errors). Returns that end, or no_chunk_ns without chunks.
+    int64_t close_at_last_waveform(int64_t no_chunk_ns);
 
     int64_t waveform_start_ns(uint64_t ticks, uint32_t sample_count) const;
     int64_t waveform_end_ns(uint64_t ticks) const;

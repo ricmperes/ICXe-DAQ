@@ -153,6 +153,49 @@ void test_chunks() {
         const int64_t end = dr.close(acq + 1000);
         CHECK(end == dr.waveform_end_ns(1000000));
     }
+    // Events not written after the last one (--max-events, error): the last chunk ends at
+    // its last waveform, not at the later stop time, and keeps the boundaries before it.
+    {
+        ChunkTracker cut(acq, acq, 816);
+        cut.add_event(0, "wf_00000.bin", 0, 1000, 1020);
+        cut.add_event(1, "wf_00001.bin", 1, 5000, 1020);
+        cut.add_event(1, "wf_00001.bin", 2, 6000, 1020);
+        const int64_t end = cut.close_at_last_waveform(acq + 50000000);
+        CHECK(end == cut.waveform_end_ns(6000));
+        CHECK(*cut.chunks().back().end_ns == end);
+        CHECK(*cut.chunks()[0].end_ns == cut.chunks()[1].start_ns);
+        ChunkTracker empty(acq, acq, 816);
+        CHECK(empty.close_at_last_waveform(acq + 7) == acq + 7);
+        CHECK(empty.chunks().empty());
+    }
+    // Random runs: closing at the last waveform never claims time after it, and closing
+    // at a later stop time ends exactly there.
+    {
+        std::mt19937 generator(20261127u);
+        std::uniform_int_distribution<uint64_t> any_step(1, 200000);
+        std::uniform_int_distribution<uint32_t> any_length(100, 3000);
+        for (int trial = 0; trial < 200; ++trial) {
+            ChunkTracker at_waveform(acq, acq, 816);
+            ChunkTracker at_stop(acq, acq, 816);
+            uint64_t event_ticks = 0;
+            for (uint32_t counter = 0; counter < 50; ++counter) {
+                event_ticks += any_step(generator);
+                const uint32_t length = any_length(generator);
+                const int file = static_cast<int>(counter / 7);
+                const std::string name = "wf_" + std::to_string(file) + ".bin";
+                at_waveform.add_event(file, name, counter, event_ticks, length);
+                at_stop.add_event(file, name, counter, event_ticks, length);
+            }
+            const int64_t last_waveform_end = at_waveform.waveform_end_ns(event_ticks);
+            CHECK(at_waveform.close_at_last_waveform(last_waveform_end + 1000000) ==
+                  last_waveform_end);
+            CHECK(at_stop.close(last_waveform_end + 1000000) == last_waveform_end + 1000000);
+            const auto& chunks = at_waveform.chunks();
+            for (std::size_t i = 0; i + 1 < chunks.size(); ++i) {
+                CHECK(*chunks[i].end_ns == chunks[i + 1].start_ns);
+            }
+        }
+    }
     // A trigger right at the start never moves the first chunk before the run start.
     {
         ChunkTracker early(acq, acq, 20);  // pre-trigger 1000 of 1020 samples

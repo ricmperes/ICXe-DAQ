@@ -91,6 +91,7 @@ The event header already carries the mask and the sample count. These metadata f
 | `files` | `["wf_00000.bin"]` | Names written in this run. |
 | `chunks` | see below | One entry per file, with its time span. |
 | `events_written` | `10` | Events across those files. |
+| `events_read_after_stop` | `3` | Events read from the board memory after the acquisition stopped, included in `events_written`. `null` when the memory was not read (`max_events`, `error`, or while the run is in progress). |
 | `sample_counts` | see below | Smallest and largest header sample count of the run, and how many events were shorter or longer than `record_length`. |
 
 ```json
@@ -128,7 +129,7 @@ The clock is the PC wall clock, so its accuracy is that of the host time sync (N
 | `stop_conditions.duration_s` | `10.0` | Time limit of the run in seconds, counted from the start of acquisition. `null` when there was none. |
 | `stop_conditions.duration_s_source` | `"command line --duration"` | Where the time limit came from: `"command line --duration"` (it replaced `duration_s` of the config) or `"config duration_s"`. |
 | `stop_conditions.max_events` | `null` | `--max-events N` of the run, `null` when not given. |
-| `board_health.start` | object | Board state just before the acquisition starts: `acquisition_status_0x8104` (raw value and decoded flags: running, memory full, external clock, PLL lock kept, board ready, channels shut down, overheated channels), `board_failure_status_0x8178` (raw value and PLL lock loss, temperature failure, ADC power down), and `adc_temperatures_celsius` (16 values, ADC chip temperature of each channel, register 0x1nA8). |
+| `board_health.start` | object | Board state just before the acquisition starts: `acquisition_status_0x8104` (raw value and decoded flags: running, event ready, memory full, external clock, PLL lock kept, board ready, channels shut down, overheated channels), `board_failure_status_0x8178` (raw value and PLL lock loss, temperature failure, ADC power down), and `adc_temperatures_celsius` (16 values, ADC chip temperature of each channel, register 0x1nA8). |
 | `board_health.end` | object or `null` | Same, read after the acquisition stopped. `null` while the run is in progress, or when the board could not be read at the end. |
 | `board_health.status_checks_during_run` | `61` | How many times 0x8104 and 0x8178 were checked during the run. The checks are due at 1 s, 2 s, ... after the start of acquisition, so a 10 s run has 9 or 10. |
 | `board_health.problems` | `[]` | Problems found by the last check (0x8104 and 0x8178), one sentence each. Empty for a run that ended normally. |
@@ -165,7 +166,8 @@ How the edges are chosen:
 
 * The first chunk starts at `acquisition_start_unix_time_ns`, or at its first waveform start if that is earlier (a trigger within the pre-trigger window of the start). It never starts before the run start.
 * The boundary between two chunks is the start of the later chunk's first waveform.
-* The last chunk ends at the PC time when acquisition stopped, or at its last waveform end if that is later.
+* The last chunk ends at the PC time when acquisition stopped, or at its last waveform end if that is later. This needs every event before the stop: after `SWStopAcquisition` the program reads the events still in the board memory and writes them (`events_read_after_stop`). This happens for the stop reasons `duration`, `sigint`, `sigterm` and `board_status`.
+* When later events were not written, the last chunk ends at its last waveform end instead, so it never claims time without data. This applies to `max_events` (events after the N-th are dropped on purpose; the board memory is not read) and `error`.
 
 Exceptions to the containment rule:
 
