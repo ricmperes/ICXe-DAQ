@@ -12,6 +12,8 @@ enum class Polarity { Positive, Negative };
 enum class DynamicRange { Vpp2, Vpp0_5 };
 enum class TriggerType { External, Rate, Coincidence };
 enum class IoLevel { Nim, Ttl };
+// Clock the board is expected to run on (0x8104 bit 5, set by the on-board switch).
+enum class ClockSource { Internal, External };
 // MON/Σ output, register 0x8144 bits[2:0] (UM2792 § Analog Monitor).
 enum class MonitorMode { Majority, Test, BufferOccupancy, VoltageLevel };
 
@@ -71,7 +73,12 @@ struct ConnectionConfig {
     bool use_vme_base_address = false;
 };
 
+// Settings of one board: the shared part of the config file merged with one
+// entry of its "boards" list.
 struct Config {
+    std::string board_name;
+    uint32_t expected_serial = 0;
+    ClockSource clock_source = ClockSource::Internal;
     std::string name = "run";
     std::string output_directory = "data";
     double duration_s = 0;
@@ -81,7 +88,6 @@ struct Config {
     uint32_t post_trigger_percent = 0;
     std::optional<int> n_buffers;
     BufferChoice buffer;
-    DynamicRange dynamic_range = DynamicRange::Vpp2;
     uint32_t max_events_blt = 32;
     ConnectionConfig connection;
     std::vector<ChannelConfig> channels;
@@ -94,12 +100,22 @@ struct Config {
     TriggerRequestConfig trigger_requests;
     AnalogMonitorConfig analog_monitor;
     std::vector<RegisterWrite> register_writes;
+    // 0x8000 bit[1]: accept a trigger while the previous record window is open.
+    bool accept_overlapping_triggers = false;
+};
+
+// A whole config file: one Config per board, in file order.
+struct RunConfig {
+    std::vector<Config> boards;
+    // Serials the program must never open for writing (boards of other users).
+    std::vector<uint32_t> protected_serials;
 };
 
 const char* to_string(Polarity p);
 const char* to_string(DynamicRange r);
 const char* to_string(TriggerType t);
 const char* to_string(IoLevel level);
+const char* to_string(ClockSource source);
 const char* to_string(MonitorMode mode);
 // Value of 0x8144 bits[2:0] for a mode.
 uint32_t monitor_mode_bits(MonitorMode mode);
@@ -114,4 +130,8 @@ uint32_t open_base_address(const ConnectionConfig& connection);
 uint32_t nominal_dac(double target_percent);
 double target_baseline_adc(double target_percent);
 
-Config load_config(const std::string& path);
+RunConfig load_config(const std::string& path);
+
+// The board called board_name. An empty name selects the only board of a
+// one-board config and is an error when the config lists several boards.
+const Config& select_board(const RunConfig& run, const std::string& board_name);

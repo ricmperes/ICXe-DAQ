@@ -67,13 +67,15 @@ Keep the scope on MON while doing this. The trigger lands up to `width_ns` after
 Fallback that needs no analog sum, for a trigger made only from detectors on one board (e.g. the 4 PMTs). With one detector per channel pair and the pair logic set to one channel, TRG-OUT can output a majority of the pair requests (0x8110 bits[9:8] = 10, level in bits[12:10]; UM5118 Sec. 1.23). With 1 µs request pulses, this is a 2-fold coincidence within 1 µs. Example for channels 0 and 2 on pairs 0 and 1, pairs switched to "only even channel":
 
 ```json
-"trigger_requests": {"width_ns": 1000, "channels": [0, 2], "trg_out": true},
+"trigger_requests": {"width_ns": 1000, "trg_out": true},
 "register_writes": [
   {"address": "0x1084", "value": "0x1", "mask": "0x3"},
   {"address": "0x1284", "value": "0x1", "mask": "0x3"},
   {"address": "0x8110", "value": "0x603", "mask": "0xC0001FFF"}
 ]
 ```
+
+and in the board entry `"trigger_request_channels": [0, 2]` (the channel list is per board since step 2c.2).
 
 `0x603` = pairs 0 and 1 enabled, majority mode, level 1, i.e. at least 2 requests. The mask also clears bits 31 and 30 (software trigger and TRG-IN to TRG-OUT, both 1 after reset), otherwise a TRG-OUT → TRG-IN cable loops every trigger back. Check TRG-OUT on the scope, then cable it to TRG-IN.
 
@@ -97,4 +99,4 @@ Superseded by [overlap_test.md](overlap_test.md), which uses the function genera
 | 2-fold trigger through 428 (inverted) + N96 at 170 mV | Works: ch0 + ch2 trigger the board, a single channel does not |
 | NIM chain delay (TRG-IN after first hit) | |
 | TRG-OUT 2-of-N majority works? (step 4) | |
-| Overlapping trigger accepted, shortened event? (step 5) | |
+| Overlapping trigger accepted, shortened event? (step 5) | Yes with 0x8000 bit[1] = 1: the following event is cut at the front and continues the previous one ([overlap_test.md](overlap_test.md)). With bit[1] = 0 a trigger within 5 µs (one record) of the previous one is dropped. |

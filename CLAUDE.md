@@ -52,3 +52,7 @@ An example for a similar system is the redax system which can be found on github
 
 The DAQ system should enable a processing of the data using the strax framework, see AxFoundation/strax.
 
+
+# Development rules for this project
+
+* Config keys: every key of the run config is required (no hidden defaults). Whenever a config key is added, changed or removed, update docs/config.md in the same change: type, allowed values, and a "What it does" text that says what the key does to the board or the run, which register it sets, when it has an effect, and what `null` / `[]` means for it. Also add the key to every file in config/ and to the self-test fixture (`full_config` in src/self_test.cpp).

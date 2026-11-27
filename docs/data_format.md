@@ -64,11 +64,11 @@ The absolute time of an event is
 
 ```text
 trigger_unix_ns = acquisition_start_unix_time_ns + trigger_time_ticks * 8
-waveform_start  = trigger_unix_ns - pre_trigger_samples_actual * 2
-waveform_end    = waveform_start + sample_count * 2
+waveform_end    = trigger_unix_ns + post_trigger_samples_actual * 2
+waveform_start  = waveform_end - sample_count * 2
 ```
 
-`sample_count` is the event's own sample count from its header. It equals `record_length` unless the board accepted an overlapping trigger (0x8000 bit[1] = 1), which shortens events. For such events the `waveform_start` rule is provisional until the overlap bench test ([overlap_test.md](overlap_test.md)) shows which samples a shortened event holds.
+`sample_count` is the event's own sample count from its header. It equals `record_length` unless the board accepted an overlapping trigger (0x8000 bit[1] = 1), which shortens events. For a full event `waveform_start` is `trigger_unix_ns - pre_trigger_samples_actual * 2`. A shortened event is cut at the front: it starts exactly where the previous event of the board ends, so the two concatenate without gap or duplicate samples (overlap bench test, [overlap_test.md](overlap_test.md)).
 
 Differences of `trigger_time_ticks` are exact board time (8 ns, up to the board oscillator accuracy). The absolute offset is only as good as the PC clock, about a millisecond (see Run timestamps).
 

@@ -7,6 +7,9 @@
 #include "util.hpp"
 #include "writer.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -17,8 +20,10 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 namespace {
 
@@ -41,14 +46,6 @@ bool throws_with(F&& fn, const std::string& fragment) {
         return std::string(ex.what()).find(fragment) != std::string::npos;
     }
     return false;
-}
-
-void replace_once(std::string& text, const std::string& from, const std::string& to) {
-    const auto pos = text.find(from);
-    if (pos == std::string::npos) {
-        throw std::runtime_error("self-test could not find \"" + from + "\"");
-    }
-    text.replace(pos, from.size(), to);
 }
 
 void test_utc_stamp() {
@@ -106,9 +103,9 @@ void test_chunks() {
         CHECK(u.unwrap(200u, read) == wrap + 200);
     }
 
-    // Chunks: record 1020 samples (2040 ns), pre-trigger 204 samples (408 ns).
+    // Chunks: record 1020 samples (2040 ns), pre-trigger 204 samples (408 ns), post 816.
     const int64_t run_start = acq - 5000000;  // run start 5 ms before acquisition
-    ChunkTracker tr(run_start, acq, 204);
+    ChunkTracker tr(run_start, acq, 816);
     // ticks of 10 events; 4 per file -> files 0, 0, 0, 0, 1, 1, 1, 1, 2, 2
     const uint64_t ticks[] = {10, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000};
     for (int i = 0; i < 10; ++i) {
@@ -138,39 +135,54 @@ void test_chunks() {
         }
     }
     // Boundary is the next chunk's first waveform start.
-    CHECK(*c[0].end_ns == tr.waveform_start_ns(4000));
+    CHECK(*c[0].end_ns == tr.waveform_start_ns(4000, 1020));
 
     // Overlapping waveforms at a boundary: the earlier chunk keeps its waveform.
     {
-        ChunkTracker ov(acq, acq, 204);
+        ChunkTracker ov(acq, acq, 816);
         ov.add_event(0, "wf_00000.bin", 0, 1000, 1020);
         ov.add_event(1, "wf_00001.bin", 1, 1100, 1020);  // 800 ns later, record is 2040 ns
-        CHECK(*ov.chunks()[0].end_ns == ov.waveform_end_ns(1000, 1020));
-        CHECK(ov.chunks()[1].start_ns == ov.waveform_end_ns(1000, 1020));
+        CHECK(*ov.chunks()[0].end_ns == ov.waveform_end_ns(1000));
+        CHECK(ov.chunks()[1].start_ns == ov.waveform_end_ns(1000));
     }
     // Clock drift: a last waveform after the PC stop time extends the last chunk.
     {
-        ChunkTracker dr(acq, acq, 0);
+        ChunkTracker dr(acq, acq, 1000);
         dr.add_event(0, "wf_00000.bin", 0, 1000000, 1000);
         const int64_t end = dr.close(acq + 1000);
-        CHECK(end == dr.waveform_end_ns(1000000, 1000));
+        CHECK(end == dr.waveform_end_ns(1000000));
     }
     // A trigger right at the start never moves the first chunk before the run start.
     {
-        ChunkTracker early(acq, acq, 1000);
+        ChunkTracker early(acq, acq, 20);  // pre-trigger 1000 of 1020 samples
         early.add_event(0, "wf_00000.bin", 0, 0, 1020);
         CHECK(early.chunks()[0].start_ns == acq);
     }
-    // An event shortened by an overlapping trigger ends after its own sample count.
+    // Overlap bench test (record 2500, pre 750, post 1750): a trigger dt after a full
+    // event gives an event of dt / 2 ns samples that starts where the full event ends.
+    // Measured: dt 4096 ns -> 2048 samples, dt 2144 ns -> 1072 samples.
     {
-        ChunkTracker short_event(acq, acq, 204);
-        short_event.add_event(0, "wf_00000.bin", 0, 1000, 1020);
-        short_event.add_event(0, "wf_00000.bin", 1, 1100, 300);
-        CHECK(short_event.waveform_end_ns(1100, 300) == short_event.waveform_start_ns(1100) + 600);
-        const auto& short_chunks = short_event.chunks();
-        CHECK(short_chunks[0].last_waveform_end_ns == short_event.waveform_end_ns(1000, 1020));
-        short_event.add_event(0, "wf_00000.bin", 2, 1500, 1020);
-        CHECK(short_chunks[0].last_waveform_end_ns == short_event.waveform_end_ns(1500, 1020));
+        ChunkTracker bench(acq, acq, 1750);
+        CHECK(bench.waveform_start_ns(1000, 2500) == acq + 1000 * 8 - 750 * 2);
+        bench.add_event(0, "wf_00000.bin", 0, 1000, 2500);
+        bench.add_event(0, "wf_00000.bin", 1, 1000 + 4096 / 8, 2048);
+        CHECK(bench.waveform_start_ns(1000 + 4096 / 8, 2048) == bench.waveform_end_ns(1000));
+        CHECK(bench.chunks()[0].last_waveform_end_ns == bench.waveform_end_ns(1000 + 4096 / 8));
+        CHECK(bench.waveform_start_ns(1000 + 2144 / 8, 1072) == bench.waveform_end_ns(1000));
+    }
+    // Same rule for any spacing on the 8 ns tick grid shorter than the record.
+    {
+        ChunkTracker any(acq, acq, 1750);
+        std::mt19937 generator(20261125u);
+        std::uniform_int_distribution<uint64_t> first_tick(0, 1u << 30);
+        std::uniform_int_distribution<uint32_t> spacing_ticks(1, 2500 * 2 / 8 - 1);
+        for (int trial = 0; trial < 2000; ++trial) {
+            const uint64_t first = first_tick(generator);
+            const uint32_t spacing = spacing_ticks(generator);
+            const uint32_t short_count = spacing * 8 / 2;
+            const int64_t short_start = any.waveform_start_ns(first + spacing, short_count);
+            CHECK(short_start == any.waveform_end_ns(first));
+        }
     }
 }
 
@@ -320,151 +332,383 @@ void test_coincidence() {
     CHECK(nominal_dac(15) > nominal_dac(85));
 }
 
-// Fixed fixture for test_config, independent of the lab's config/default.json.
-const char* kConfigFixture = R"({
-  "name": "fixture",
-  "output_directory": "data",
-  "waveforms_per_file": 1000,
-  "record_length": 1020,
-  "pre_trigger_samples": 200,
-  "n_buffers": null,
-  "connection": {
-    "link_type": "optical",
-    "link_num": 0,
-    "conet_node": 0,
-    "vme_base_address": "0x32140000",
-    "use_vme_base_address": false
-  },
-  "baseline": {"apply_on_start": true},
-  "channels": [
-    {"index": 0, "polarity": "negative", "target_percent": 85, "threshold": 30},
-    {"index": 1, "polarity": "negative", "target_percent": 85, "threshold": 30},
-    {"index": 2, "polarity": "negative", "target_percent": 85, "threshold": 30}
-  ],
-  "trigger": {
-    "type": "external",
-    "io_level": "NIM",
-    "coincidence": {"majority": 0, "window_ns": 48, "pairs": [{"channels": [0, 1], "logic": "and"}]}
-  }
-})";
+RunConfig load_json(const fs::path& path, const json& config) {
+    {
+        std::ofstream out(path);
+        out << config.dump(2);
+    }
+    return load_config(path.string());
+}
+
+template <class F>
+bool load_fails_with(const fs::path& path, const json& config, F&& change,
+                     const std::string& fragment) {
+    json changed = config;
+    change(changed);
+    return throws_with([&] { load_json(path, changed); }, fragment);
+}
+
+// All 16 channels; the channels in enabled_mask are enabled.
+json full_channels(uint32_t enabled_mask) {
+    json channels = json::array();
+    for (int index = 0; index < 16; ++index) {
+        channels.push_back({{"index", index},
+                            {"enabled", (enabled_mask & (1u << index)) != 0u},
+                            {"polarity", "negative"},
+                            {"target_percent", 85},
+                            {"threshold", 30},
+                            {"dynamic_range", "2Vpp"}});
+    }
+    return channels;
+}
+
+json full_board(const std::string& name, const std::string& base, uint32_t serial,
+                const std::string& clock) {
+    return {{"name", name},
+            {"vme_base_address", base},
+            {"serial", serial},
+            {"clock_source", clock},
+            {"channels", full_channels(0x5u)},
+            {"coincidence", nullptr},
+            {"trigger_request_channels", json::array()},
+            {"register_writes", json::array()}};
+}
+
+// Complete config with every key; boards B1 to B4 through the V4718.
+json full_config() {
+    return {{"name", "fixture"},
+            {"output_directory", "data"},
+            {"duration_s", 0},
+            {"waveforms_per_file", 1000},
+            {"record_length", 2500},
+            {"pre_trigger_samples", 750},
+            {"n_buffers", nullptr},
+            {"max_events_blt", 32},
+            {"connection",
+             {{"link_type", "optical"},
+              {"link_num", 0},
+              {"conet_node", 0},
+              {"use_vme_base_address", true}}},
+            {"baseline",
+             {{"apply_on_start", true},
+              {"tolerance_lsb", 5},
+              {"max_iterations", 12},
+              {"triggers_per_step", 8}}},
+            {"trigger", {{"type", "external"}, {"io_level", "NIM"}, {"rate_hz", nullptr}}},
+            {"trigger_requests", nullptr},
+            {"analog_monitor", nullptr},
+            {"register_writes", json::array()},
+            {"accept_overlapping_triggers", true},
+            {"protected_serials", {30176}},
+            {"boards",
+             {full_board("B1", "0x32100000", 30165, "internal"),
+              full_board("B2", "0x32110000", 30166, "external"),
+              full_board("B3", "0x32120000", 30167, "external"),
+              full_board("B4", "0x32130000", 30168, "external")}}};
+}
+
+// One board on its own optical port (open base 0).
+json single_board_config() {
+    json config = full_config();
+    config["connection"]["use_vme_base_address"] = false;
+    config["boards"] = json::array({full_board("B1", "0x32140000", 30165, "internal")});
+    return config;
+}
 
 void test_config(const fs::path& dir) {
-    const fs::path config_path = dir / "config_fixture.json";
-    {
-        std::ofstream out(config_path);
-        out << kConfigFixture;
-    }
-    const Config cfg = load_config(config_path.string());
+    const fs::path path = dir / "config_fixture.json";
+    const RunConfig run = load_json(path, single_board_config());
+    CHECK(run.boards.size() == 1);
+    CHECK(run.protected_serials.size() == 1 && run.protected_serials[0] == 30176u);
+    const Config& cfg = select_board(run, "");
+    CHECK(&cfg == &select_board(run, "B1"));
+    CHECK(throws_with([&] { select_board(run, "B2"); }, "no board named B2"));
+    CHECK(cfg.board_name == "B1");
+    CHECK(cfg.expected_serial == 30165u);
+    CHECK(cfg.clock_source == ClockSource::Internal);
     CHECK(cfg.connection.link_type == "optical");
     CHECK(cfg.connection.vme_base_address == 0x32140000u);
     CHECK(!cfg.connection.use_vme_base_address);
     CHECK(open_base_address(cfg.connection) == 0u);
     CHECK(link_type_implemented(cfg.connection.link_type));
-    CHECK(cfg.record_length == 1020);
-    CHECK(cfg.pre_trigger_samples == 200);
+    CHECK(cfg.record_length == 2500);
+    CHECK(cfg.pre_trigger_samples == 750);
+    CHECK(cfg.post_trigger_percent == 70);
+    CHECK(cfg.buffer.nb == 1024);
     CHECK(cfg.waveforms_per_file == 1000);
+    CHECK(cfg.max_events_blt == 32);
     CHECK(cfg.output_directory == "data");
     CHECK(cfg.trigger == TriggerType::External);
     CHECK(cfg.io_level == IoLevel::Nim);
-    CHECK(cfg.channels.size() == 3);
-    CHECK(cfg.channel_mask == 0x7u);
-    CHECK(cfg.buffer.k == 10);
-    CHECK(cfg.buffer.nb == 1024);
-    CHECK(cfg.post_trigger_percent == 80);
-    CHECK(cfg.coincidence.has_value());
-    CHECK(cfg.baseline.apply_on_start);
-
-    const std::string text = kConfigFixture;
-    std::string unknown = text;
-    replace_once(unknown, "\"link_type\": \"optical\"", "\"link_type\": \"banana\"");
-    const fs::path bad_path = dir / "bad_link.json";
-    {
-        std::ofstream out(bad_path);
-        out << unknown;
-    }
-    CHECK(throws_with([&] { load_config(bad_path.string()); }, "unknown link_type"));
-
-    std::string later = text;
-    replace_once(later, "\"link_type\": \"optical\"", "\"link_type\": \"eth_v4718\"");
-    const fs::path later_path = dir / "v4718.json";
-    {
-        std::ofstream out(later_path);
-        out << later;
-    }
-    const Config v4718 = load_config(later_path.string());
-    CHECK(v4718.connection.link_type == "eth_v4718");
-    CHECK(!link_type_implemented(v4718.connection.link_type));
-
-    std::string with_base = text;
-    replace_once(with_base, "\"use_vme_base_address\": false", "\"use_vme_base_address\": true");
-    const fs::path base_path = dir / "use_base.json";
-    {
-        std::ofstream out(base_path);
-        out << with_base;
-    }
-    const Config based = load_config(base_path.string());
-    CHECK(based.connection.use_vme_base_address);
-    CHECK(open_base_address(based.connection) == 0x32140000u);
-
+    CHECK(cfg.rate_hz == 0.0);
+    CHECK(cfg.channels.size() == 16);
+    CHECK(cfg.channel_mask == 0x5u);
+    CHECK(cfg.channels[3].range == DynamicRange::Vpp2 && !cfg.channels[3].enabled);
+    CHECK(!cfg.coincidence.has_value());
+    CHECK(cfg.baseline.apply_on_start && cfg.baseline.triggers_per_step == 8);
+    CHECK(cfg.accept_overlapping_triggers);
     CHECK(!cfg.trigger_requests.configured);
     CHECK(!cfg.analog_monitor.configured);
     CHECK(cfg.register_writes.empty());
+
+    const json base = single_board_config();
+    CHECK(load_fails_with(path, base, [](json& c) { c["connection"]["link_type"] = "banana"; },
+                          "unknown link_type"));
+    json later = base;
+    later["connection"]["link_type"] = "eth_v4718";
+    CHECK(!link_type_implemented(load_json(path, later).boards[0].connection.link_type));
+    json with_base = base;
+    with_base["connection"]["use_vme_base_address"] = true;
+    CHECK(open_base_address(load_json(path, with_base).boards[0].connection) == 0x32140000u);
 }
 
-// Config with extra top-level keys inserted before "trigger".
-Config load_with(const std::string& base_text, const fs::path& path, const std::string& extra) {
-    std::string text = base_text;
-    replace_once(text, "\"trigger\": {", extra + ",\n  \"trigger\": {");
-    {
-        std::ofstream out(path);
-        out << text;
+// No hidden defaults: removing any single key makes the config invalid.
+void test_every_key_required(const fs::path& dir) {
+    const fs::path path = dir / "missing_key.json";
+    json config = full_config();
+    config["trigger_requests"] = {{"width_ns", 1000}, {"trg_out", false}};
+    config["analog_monitor"] = {{"mode", "majority"}, {"level_volts", nullptr}};
+    config["register_writes"] = json::array({{{"address", "0x8000"}, {"value", 0}, {"mask", 64}}});
+    for (json& board : config["boards"]) {
+        board["trigger_request_channels"] = {0};
     }
-    return load_config(path.string());
+    config["boards"][2]["coincidence"] = {
+        {"majority", 0},
+        {"window_ns", 48},
+        {"pairs", json::array({{{"channels", {0}}, {"logic", "even"}}})}};
+    CHECK(load_json(path, config).boards.size() == 4);
+
+    int checked = 0;
+    const auto check_removal = [&](const std::string& where, const auto& locate) {
+        json probe = config;
+        json& object = locate(probe);
+        std::vector<std::string> keys;
+        for (const auto& item : object.items()) {
+            keys.push_back(item.key());
+        }
+        for (const std::string& key : keys) {
+            json removed = config;
+            locate(removed).erase(key);
+            const bool rejected = throws_with([&] { load_json(path, removed); }, "");
+            if (!rejected) {
+                std::fprintf(stderr, "FAIL key %s in %s is not required\n", key.c_str(),
+                             where.c_str());
+                ++g_fails;
+            }
+            ++checked;
+        }
+    };
+    check_removal("the config", [](json& c) -> json& { return c; });
+    check_removal("connection", [](json& c) -> json& { return c["connection"]; });
+    check_removal("baseline", [](json& c) -> json& { return c["baseline"]; });
+    check_removal("trigger", [](json& c) -> json& { return c["trigger"]; });
+    check_removal("trigger_requests", [](json& c) -> json& { return c["trigger_requests"]; });
+    check_removal("analog_monitor", [](json& c) -> json& { return c["analog_monitor"]; });
+    check_removal("register_writes[0]", [](json& c) -> json& { return c["register_writes"][0]; });
+    check_removal("board B3", [](json& c) -> json& { return c["boards"][2]; });
+    check_removal("B3 coincidence", [](json& c) -> json& { return c["boards"][2]["coincidence"]; });
+    check_removal("B3 channel 5", [](json& c) -> json& { return c["boards"][2]["channels"][5]; });
+    CHECK(checked == 17 + 4 + 4 + 3 + 2 + 2 + 3 + 8 + 3 + 6);
+
+    CHECK(load_fails_with(path, config, [](json& c) { c["boards"][1]["channels"].erase(15); },
+                          "board B2: channels must list all 16 channels"));
+    CHECK(load_fails_with(path, config,
+                          [](json& c) { c["boards"][1]["channels"][15]["index"] = 14; },
+                          "board B2: duplicate channel index 14"));
+    CHECK(load_fails_with(path, config,
+                          [](json& c) { c["boards"][1]["channels"][4]["threshold"] = -1; },
+                          "board B2: channel 4: threshold must be >= 0"));
+    CHECK(load_fails_with(path, config, [](json& c) { c["baseline"]["typo"] = 1; },
+                          "unknown key \"typo\" in baseline"));
+    CHECK(load_fails_with(path, config,
+                          [](json& c) { c["boards"][0]["channels"][0]["gain"] = 1; },
+                          "unknown key \"gain\" in channel"));
 }
 
-// Fixed fixture, independent of the lab's config/default.json: channels 0-2
-// enabled with thresholds, external trigger.
-const char* kBenchFixture = R"({
-  "name": "bench",
-  "record_length": 1020,
-  "pre_trigger_samples": 200,
-  "connection": {"link_type": "optical", "link_num": 0, "conet_node": 0,
-                 "vme_base_address": "0x32140000", "use_vme_base_address": false},
-  "channels": [
-    {"index": 0, "polarity": "negative", "target_percent": 85, "threshold": 30},
-    {"index": 1, "polarity": "negative", "target_percent": 85, "threshold": 30},
-    {"index": 2, "polarity": "negative", "target_percent": 85, "threshold": 30}
-  ],
-  "trigger": {"type": "external", "io_level": "NIM"}
-})";
+void test_run_config(const fs::path& dir) {
+    const fs::path path = dir / "run_config.json";
+    json config = full_config();
+    config["trigger_requests"] = {{"width_ns", 1000}, {"trg_out", false}};
+    config["register_writes"] =
+        json::array({{{"address", "0x8000"}, {"value", "0x0"}, {"mask", "0x40"}}});
+    for (json& board : config["boards"]) {
+        board["trigger_request_channels"] = {0, 2};
+    }
+    config["boards"][1]["trigger_request_channels"] = {2};
+    config["boards"][1]["register_writes"] =
+        json::array({{{"address", "0x1070"}, {"value", 125}, {"mask", "0xFF"}}});
+    config["boards"][2]["coincidence"] = {
+        {"majority", 0},
+        {"window_ns", 48},
+        {"pairs", json::array({{{"channels", {0}}, {"logic", "even"}}})}};
+    const RunConfig run = load_json(path, config);
+    CHECK(run.boards.size() == 4);
+    const char* names[] = {"B1", "B2", "B3", "B4"};
+    for (std::size_t i = 0; i < run.boards.size(); ++i) {
+        const Config& board = run.boards[i];
+        CHECK(board.board_name == names[i]);
+        CHECK(board.expected_serial == 30165u + i);
+        CHECK(board.connection.vme_base_address == 0x32100000u + 0x10000u * i);
+        CHECK(open_base_address(board.connection) == board.connection.vme_base_address);
+        CHECK(board.clock_source == (i == 0 ? ClockSource::Internal : ClockSource::External));
+        CHECK(board.channel_mask == 0x5u);
+        CHECK(board.record_length == 2500u);
+        CHECK(board.accept_overlapping_triggers);
+        CHECK(board.trigger_requests.width_steps == 125u);
+        CHECK(board.trigger_requests.channel_mask == (i == 1 ? 0x4u : 0x5u));
+        CHECK(board.register_writes.size() == (i == 1 ? 2u : 1u));
+        CHECK(board.register_writes[0].address == 0x8000u);
+        CHECK(board.coincidence.has_value() == (i == 2));
+        CHECK(&select_board(run, names[i]) == &board);
+    }
+    CHECK(run.boards[1].register_writes.size() == 2u &&
+          run.boards[1].register_writes[1].address == 0x1070u);
+    CHECK(throws_with([&] { select_board(run, ""); }, "several boards (B1, B2, B3, B4)"));
+
+    const json base = full_config();
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][1]["name"] = "B1"; },
+                          "board name B1 appears twice"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][1]["serial"] = 30165; },
+                          "serial 30165 appears twice"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][1]["vme_base_address"] = "0x32100000"; },
+                          "appears twice"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][3]["serial"] = 30176; },
+                          "protected_serials"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][1]["clock_source"] = "internal"; },
+                          "exactly one board with clock_source internal"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][0]["clock_source"] = "external"; },
+                          "found 0"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["connection"]["use_vme_base_address"] = false; },
+                          "use_vme_base_address true"));
+    json one = base;
+    one["boards"] = json::array({full_board("B2", "0x32110000", 30166, "external")});
+    CHECK(load_json(path, one).boards.size() == 1);
+
+    CHECK(load_fails_with(path, base, [](json& c) { c["channels"] = json::array(); },
+                          "belongs into each entry"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["banana"] = 1; }, "unknown key \"banana\""));
+    CHECK(load_fails_with(path, base, [](json& c) { c["dynamic_range"] = "2Vpp"; },
+                          "unknown key \"dynamic_range\""));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["connection"]["vme_base_address"] = "0x0"; },
+                          "belongs into each entry"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["trigger"]["coincidence"] = nullptr; },
+                          "\"coincidence\" in trigger"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) {
+                              c["trigger_requests"] = {
+                                  {"width_ns", 0}, {"trg_out", false}, {"channels", {0}}};
+                          },
+                          "trigger_request_channels"));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][1]["trigger_request_channels"] = {0}; },
+                          "board B2: trigger_request_channels must be [] while trigger_requests"));
+    CHECK(load_fails_with(path, config,
+                          [](json& c) { c["boards"][1]["trigger_request_channels"] = {1}; },
+                          "board B2: trigger_request_channels must be enabled channels"));
+    CHECK(load_fails_with(path, config,
+                          [](json& c) {
+                              c["boards"][1]["trigger_request_channels"] = json::array();
+                          },
+                          "board B2: trigger_request_channels must be a non-empty array"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"] = json::array(); },
+                          "\"boards\" must be a non-empty array"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][0]["dynamic_range"] = "2Vpp"; },
+                          "board B1: unknown key \"dynamic_range\""));
+    CHECK(load_fails_with(path, base,
+                          [](json& c) { c["boards"][1]["channels"][2]["index"] = 16; },
+                          "board B2: channel index must be 0..15"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["boards"][0]["clock_source"] = "master"; },
+                          "clock_source must be"));
+    CHECK(load_fails_with(path, base, [](json& c) { c["accept_overlapping_triggers"] = 1; },
+                          "missing boolean \"accept_overlapping_triggers\""));
+    CHECK(load_fails_with(path, base, [](json& c) { c["trigger"]["type"] = "rate"; },
+                          "rate trigger requires rate_hz > 0"));
+    json rate = base;
+    rate["trigger"]["type"] = "rate";
+    rate["trigger"]["rate_hz"] = 10;
+    CHECK(load_json(path, rate).boards[0].rate_hz == 10.0);
+
+    // Random board lists: distinct names, serials and base addresses load in order; copying
+    // one of these fields from one board to another is always rejected.
+    std::mt19937 generator(20261127u);
+    for (int trial = 0; trial < 200; ++trial) {
+        const int board_count = std::uniform_int_distribution<int>(1, 8)(generator);
+        const int master = std::uniform_int_distribution<int>(0, board_count - 1)(generator);
+        std::vector<int> slots(16);
+        for (int slot = 0; slot < 16; ++slot) {
+            slots[slot] = slot;
+        }
+        std::shuffle(slots.begin(), slots.end(), generator);
+        json random_config = base;
+        random_config["boards"] = json::array();
+        for (int i = 0; i < board_count; ++i) {
+            const uint32_t slot = static_cast<uint32_t>(slots[i]);
+            random_config["boards"].push_back(
+                full_board("board_" + std::to_string(slot), hex32(0x32000000u + 0x10000u * slot),
+                           20000u + 7u * slot, i == master ? "internal" : "external"));
+        }
+        const RunConfig random_run = load_json(path, random_config);
+        CHECK(static_cast<int>(random_run.boards.size()) == board_count);
+        for (int i = 0; i < board_count; ++i) {
+            const json& entry = random_config["boards"][i];
+            CHECK(select_board(random_run, entry["name"].get<std::string>()).expected_serial ==
+                  entry["serial"].get<uint32_t>());
+        }
+        if (board_count > 1) {
+            const int copy_from = std::uniform_int_distribution<int>(0, board_count - 1)(generator);
+            int copy_to = std::uniform_int_distribution<int>(0, board_count - 2)(generator);
+            copy_to += copy_to >= copy_from ? 1 : 0;
+            const char* fields[] = {"name", "vme_base_address", "serial"};
+            const char* field = fields[std::uniform_int_distribution<int>(0, 2)(generator)];
+            CHECK(load_fails_with(
+                path, random_config,
+                [&](json& c) { c["boards"][copy_to][field] = c["boards"][copy_from][field]; },
+                "appears twice"));
+        }
+    }
+}
 
 void test_bench_keys(const fs::path& dir) {
-    const std::string text = kBenchFixture;
     const fs::path path = dir / "bench_keys.json";
+    json base = single_board_config();
+    base["boards"][0]["channels"] = full_channels(0x7u);
+    const auto load_changed = [&](const auto& change) {
+        json changed = base;
+        change(changed);
+        return load_json(path, changed).boards[0];
+    };
+    const auto with_requests = [](int width_ns, bool trg_out, const json& channels) {
+        return [=](json& c) {
+            c["trigger_requests"] = {{"width_ns", width_ns}, {"trg_out", trg_out}};
+            c["boards"][0]["trigger_request_channels"] = channels;
+        };
+    };
 
-    const Config tr = load_with(text, path, "\"trigger_requests\": {\"width_ns\": 1000}");
+    const Config tr = load_changed(with_requests(1000, false, {0, 1, 2}));
     CHECK(tr.trigger_requests.configured);
     CHECK(tr.trigger_requests.width_ns == 1000u);
     CHECK(tr.trigger_requests.width_steps == 125u);
     CHECK(tr.trigger_requests.channel_mask == 0x7u);
     CHECK(!tr.trigger_requests.trg_out);
 
-    const Config one = load_with(
-        text, path, "\"trigger_requests\": {\"channels\": [1], \"trg_out\": true}");
+    const Config one = load_changed(with_requests(0, true, {1}));
     CHECK(one.trigger_requests.channel_mask == 0x2u);
     CHECK(one.trigger_requests.width_steps == 0u);
     CHECK(one.trigger_requests.trg_out);
 
-    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"width_ns\": 1001}"); },
-                      "multiple of 8"));
-    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"width_ns\": 2048}"); },
-                      "at most 2040"));
-    CHECK(load_with(text, path, "\"trigger_requests\": {\"width_ns\": 2040}")
-              .trigger_requests.width_steps == 255u);
-    CHECK(throws_with([&] { load_with(text, path, "\"trigger_requests\": {\"channels\": [5]}"); },
-                      "enabled channels"));
+    CHECK(throws_with([&] { load_changed(with_requests(1001, false, {0})); }, "multiple of 8"));
+    CHECK(throws_with([&] { load_changed(with_requests(2048, false, {0})); }, "at most 2040"));
+    CHECK(load_changed(with_requests(2040, false, {0})).trigger_requests.width_steps == 255u);
+    CHECK(throws_with([&] { load_changed(with_requests(1000, false, {5})); }, "enabled channels"));
 
-    const Config maj = load_with(text, path, "\"analog_monitor\": {\"mode\": \"majority\"}");
+    CHECK(!load_changed([](json& c) { c["accept_overlapping_triggers"] = false; })
+               .accept_overlapping_triggers);
+
+    const Config maj = load_changed(
+        [](json& c) { c["analog_monitor"] = {{"mode", "majority"}, {"level_volts", nullptr}}; });
     CHECK(maj.analog_monitor.configured);
     CHECK(maj.analog_monitor.mode == MonitorMode::Majority);
     CHECK(monitor_mode_bits(MonitorMode::Majority) == 0u);
@@ -472,23 +716,21 @@ void test_bench_keys(const fs::path& dir) {
     CHECK(monitor_mode_bits(MonitorMode::BufferOccupancy) == 3u);
     CHECK(monitor_mode_bits(MonitorMode::VoltageLevel) == 4u);
 
-    const Config lvl = load_with(
-        text, path, "\"analog_monitor\": {\"mode\": \"voltage_level\", \"level_volts\": 0.25}");
-    CHECK(lvl.analog_monitor.level_code == 1024u);
-    CHECK(throws_with(
-        [&] {
-            load_with(text, path,
-                      "\"analog_monitor\": {\"mode\": \"voltage_level\", \"level_volts\": 2.0}");
-        },
-        "level_volts"));
-    CHECK(throws_with(
-        [&] { load_with(text, path, "\"analog_monitor\": {\"mode\": \"sawtooth\"}"); },
-        "analog_monitor.mode"));
+    const auto with_monitor = [](const char* mode, const json& level) {
+        return [=](json& c) { c["analog_monitor"] = {{"mode", mode}, {"level_volts", level}}; };
+    };
+    CHECK(load_changed(with_monitor("voltage_level", 0.25)).analog_monitor.level_code == 1024u);
+    CHECK(throws_with([&] { load_changed(with_monitor("voltage_level", 2.0)); }, "level_volts"));
+    CHECK(throws_with([&] { load_changed(with_monitor("majority", 0.25)); },
+                      "level_volts must be null"));
+    CHECK(throws_with([&] { load_changed(with_monitor("sawtooth", nullptr)); },
+                      "analog_monitor.mode"));
 
-    const Config raw = load_with(
-        text, path,
-        "\"register_writes\": [{\"address\": \"0x1070\", \"value\": 125},"
-        " {\"address\": 4228, \"value\": \"0x4\", \"mask\": \"0x4\"}]");
+    const Config raw = load_changed([](json& c) {
+        c["register_writes"] =
+            json::array({{{"address", "0x1070"}, {"value", 125}, {"mask", "0xFFFFFFFF"}},
+                         {{"address", 4228}, {"value", "0x4"}, {"mask", "0x4"}}});
+    });
     CHECK(raw.register_writes.size() == 2);
     CHECK(raw.register_writes[0].address == 0x1070u);
     CHECK(raw.register_writes[0].value == 125u);
@@ -497,7 +739,10 @@ void test_bench_keys(const fs::path& dir) {
     CHECK(raw.register_writes[1].mask == 0x4u);
     CHECK(throws_with(
         [&] {
-            load_with(text, path, "\"register_writes\": [{\"address\": \"0x1071\", \"value\": 1}]");
+            load_changed([](json& c) {
+                c["register_writes"] =
+                    json::array({{{"address", "0x1071"}, {"value", 1}, {"mask", 1}}});
+            });
         },
         "multiple of 4"));
 }
@@ -641,6 +886,8 @@ int run_self_test(const std::string& config_path) {
         test_sample_count_summary();
         test_coincidence();
         test_config(dir);
+        test_every_key_required(dir);
+        test_run_config(dir);
         test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {

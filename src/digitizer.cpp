@@ -354,6 +354,9 @@ public:
     Session& operator=(const Session&) = delete;
 
     void print_info(FILE* out) const {
+        std::fprintf(out, "board_name: %s\n", cfg_.board_name.c_str());
+        std::fprintf(out, "expected_serial: %u\n", cfg_.expected_serial);
+        std::fprintf(out, "expected_clock_source: %s\n", to_string(cfg_.clock_source));
         std::fprintf(out, "model: %s\n", board_.model_name.c_str());
         std::fprintf(out, "model_code: %u\n", board_.model);
         std::fprintf(out, "serial: %u\n", board_.serial);
@@ -719,6 +722,7 @@ public:
         }
         apply_trigger_requests();
         apply_analog_monitor();
+        apply_overlap_acceptance();
         apply_register_writes();
         uint32_t rb = 0;
         check(CAEN_DGTZ_ReadRegister(handle_, 0x810C, &rb), "read 0x810C");
@@ -751,7 +755,7 @@ public:
         // The trigger time tag counts from this start. acq_start_ns_ is taken
         // just before SWStartAcquisition, after started.
         TimeTagUnwrapper unwrapper(acq_start_ns_);
-        ChunkTracker chunks(started.unix_ns, acq_start_ns_, pre_actual_);
+        ChunkTracker chunks(started.unix_ns, acq_start_ns_, post_actual_);
         SampleCountSummary sample_counts(record_read_);
         meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
         const auto update_files = [&] {
@@ -1334,6 +1338,17 @@ private:
         std::fflush(stderr);
     }
 
+    void apply_overlap_acceptance() {
+        constexpr uint32_t kOverlapBit = 0x2u;
+        overlap_access_ = access_masked(
+            0x8000u, cfg_.accept_overlapping_triggers ? kOverlapBit : 0u, kOverlapBit);
+        std::fprintf(stderr, "accept_overlapping_triggers: %s, 0x8000 readback=%s%s\n",
+                     cfg_.accept_overlapping_triggers ? "true" : "false",
+                     hex32(overlap_access_.after).c_str(),
+                     overlap_access_.matches() ? "" : "  WARNING: readback differs");
+        std::fflush(stderr);
+    }
+
     void apply_register_writes() {
         raw_access_.clear();
         for (const RegisterWrite& w : cfg_.register_writes) {
@@ -1525,6 +1540,9 @@ private:
         if (board_.has_board_info_reg) {
             meta["board"]["board_info_0x8140"] = hex32(board_.board_info_reg);
         }
+        meta["board"]["name"] = cfg_.board_name;
+        meta["board"]["expected_serial"] = cfg_.expected_serial;
+        meta["board"]["expected_clock_source"] = to_string(cfg_.clock_source);
         meta["link"] = {
             {"link_type", cfg_.connection.link_type},
             {"link_num", cfg_.connection.link_num},
@@ -1561,7 +1579,6 @@ private:
             "event_counter is the digitizer header counter. Baseline software triggers can advance it before the run.";
         meta["channel_mask"] = hex32(cfg_.channel_mask);
         meta["enabled_channels"] = channels_from_mask(cfg_.channel_mask);
-        meta["dynamic_range"] = to_string(cfg_.dynamic_range);
 
         json trig = {{"type", to_string(cfg_.trigger)}, {"io_level", to_string(cfg_.io_level)}};
         if (cfg_.trigger == TriggerType::Rate) {
@@ -1641,6 +1658,9 @@ private:
             raw.push_back(register_access_json(a));
         }
         meta["register_writes"] = raw;
+        meta["accept_overlapping_triggers"] = {
+            {"set", cfg_.accept_overlapping_triggers},
+            {"register_0x8000", register_access_json(overlap_access_)}};
 
         json channels = json::array();
         for (const ChannelResult& result : results_) {
@@ -1727,6 +1747,7 @@ private:
     std::vector<RegisterAccess> shape_access_;
     std::vector<RegisterAccess> monitor_access_;
     std::vector<RegisterAccess> raw_access_;
+    RegisterAccess overlap_access_;
     std::unique_ptr<ReadoutBuffer> readout_;
 };
 

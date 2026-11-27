@@ -6,13 +6,11 @@
   "record_length": 2500,
   "pre_trigger_samples": 750,
   "n_buffers": null,
-  "dynamic_range": "2Vpp",
   "max_events_blt": 32,
   "connection": {
     "link_type": "optical",
     "link_num": 0,
     "conet_node": 0,
-    "vme_base_address": "0x32100000",
     "use_vme_base_address": true
   },
   "baseline": {
@@ -21,24 +19,45 @@
     "max_iterations": 12,
     "triggers_per_step": 8
   },
-  "channels": [
-    {
-      "index": 0,
-      "enabled": true,
-      "polarity": "negative",
-      "target_percent": 85,
-      "threshold": 30
-    }
-  ],
   "trigger": {
     "type": "external",
-    "io_level": "NIM"
+    "io_level": "NIM",
+    "rate_hz": null
   },
-  "register_writes": [
+  "accept_overlapping_triggers": true,
+  "trigger_requests": null,
+  "analog_monitor": null,
+  "register_writes": [],
+  "protected_serials": [
+    30176
+  ],
+  "boards": [
     {
-      "address": "0x8000",
-      "value": "0x2",
-      "mask": "0x2"
+      "name": "B1",
+      "vme_base_address": "0x32100000",
+      "serial": 30165,
+      "clock_source": "internal",
+      "coincidence": null,
+      "trigger_request_channels": [],
+      "register_writes": [],
+      "channels": [
+        {"index": 0, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 1, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 2, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 3, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 4, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 5, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 6, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 7, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 8, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 9, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 10, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 11, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 12, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 13, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 14, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"},
+        {"index": 15, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 30, "dynamic_range": "2Vpp"}
+      ]
     }
   ]
 }

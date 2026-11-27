@@ -51,14 +51,15 @@ struct ChunkInfo {
 //   * The last chunk ends at the acquisition stop, or at its last waveform end
 //     if that is later.
 //
-// Waveform start = trigger time - pre-trigger, end = start + sample_count
-// samples. For an event shortened by an overlapping trigger the start rule is
-// provisional until the overlap test (PLAN.md, 2c.1) shows which samples such
-// an event holds.
+// Waveform end = trigger time + post-trigger, start = end - sample_count
+// samples. A full event therefore starts at trigger - pre-trigger. An event
+// shortened by an overlapping trigger (0x8000 bit[1] = 1) is cut at the front:
+// it starts where the previous event ends (overlap bench test, 2026-11-25,
+// docs/overlap_test.md).
 class ChunkTracker {
 public:
     ChunkTracker(int64_t run_start_ns, int64_t acquisition_start_ns,
-                 uint32_t pre_trigger_samples);
+                 uint32_t post_trigger_samples);
 
     // Event written to file_index / file. ticks from TimeTagUnwrapper,
     // sample_count = samples per channel of this event.
@@ -68,8 +69,8 @@ public:
     // Ends the last chunk and returns its end (or stop_ns when there is no chunk).
     int64_t close(int64_t stop_ns);
 
-    int64_t waveform_start_ns(uint64_t ticks) const;
-    int64_t waveform_end_ns(uint64_t ticks, uint32_t sample_count) const;
+    int64_t waveform_start_ns(uint64_t ticks, uint32_t sample_count) const;
+    int64_t waveform_end_ns(uint64_t ticks) const;
 
     const std::vector<ChunkInfo>& chunks() const { return chunks_; }
     int64_t acquisition_start_ns() const { return acquisition_start_ns_; }
@@ -77,6 +78,6 @@ public:
 private:
     int64_t run_start_ns_;
     int64_t acquisition_start_ns_;
-    int64_t pre_trigger_ns_;
+    int64_t post_trigger_ns_;
     std::vector<ChunkInfo> chunks_;
 };

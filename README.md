@@ -24,12 +24,14 @@ The self-test checks buffer-organization choice, JSON loading, and a waveform-fi
 ## Commands
 
 ```bash
-./build/icxe-daq info  --config config/default.json
-./build/icxe-daq run   --config config/default.json
-./build/icxe-daq run   --config config/default.json --max-events 100
-./build/icxe-daq scope --config config/default.json --channel 0
-./build/icxe-daq reg   --config config/default.json --address 0x1070 [--value 0x7D]
+./build/icxe-daq info  --config config/four_boards.json --board B1
+./build/icxe-daq run   --config config/overlap_on.json
+./build/icxe-daq run   --config config/overlap_on.json --max-events 100
+./build/icxe-daq scope --config config/four_boards.json --board B2 --channel 0
+./build/icxe-daq reg   --config config/four_boards.json --board B3 --address 0x1070 [--value 0x7D]
 ```
+
+A config lists one or more boards ([docs/config.md](docs/config.md)). `--board NAME` picks one; it can be left out when the config has only one board. Runs on several boards at once come with step 2c.4 (PLAN.md).
 
 `reg` reads one register, or writes it and reads it back, without resetting or programming the board. It is meant for bench tests such as the MON/Σ majority test in [docs/mon_test.md](docs/mon_test.md), which also uses the optional `trigger_requests`, `analog_monitor` and `register_writes` config keys ([docs/config.md](docs/config.md)).
 
@@ -56,36 +58,9 @@ events=1500 file=1 stop=max_events
 
 ## JSON
 
-`config/default.json` is a working example: three channels, external NIM trigger, 1020-sample records, 200-sample pre-trigger, 1000 waveforms per file, baseline targets, output directory `data`. 1020 is used because a V1730 record length must be a multiple of 10; 1024 is rejected.
+`config/four_boards.json` is a complete example: B1 to B4 through the V4718, channels 0 to 2 enabled on each, external NIM trigger, 2500-sample records with 750 pre-trigger samples, MON/Σ majority. Record lengths must be a multiple of 10; 1024 is rejected.
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Run directory prefix. Letters, digits, `-`, `_`. |
-| `output_directory` | Parent of the run directory. |
-| `duration_s` | Stop after this many seconds of acquisition. `0` means no time limit. Baseline time is not included. |
-| `waveforms_per_file` | Events per `wf_*.bin` before the next file is opened. |
-| `record_length` | Samples per channel. Must be a positive multiple of 10 and must fit in one SRAM buffer. |
-| `pre_trigger_samples` | Samples requested before the trigger. See below. |
-| `n_buffers` | Optional. `null` picks the largest `Nb` that still holds the record. An integer must be `2^k` for `k = 0..10` and is rejected when the record does not fit. |
-| `dynamic_range` | `"2Vpp"` (default) or `"0.5Vpp"`. A channel may override it. |
-| `max_events_blt` | Events per `ReadData` call (default 32). |
-| `connection.link_type` | `"optical"` is implemented. `"eth_v4718"` and `"usb_v4718"` are accepted and rejected at open so a later bridge can be added. Any other string is rejected at load. |
-| `connection.link_num`, `conet_node` | A5818 link and daisy-chain node. This board is link 0, node 0. |
-| `connection.vme_base_address` | Stored rotary address, `"0x32140000"`. |
-| `connection.use_vme_base_address` | `false` opens with base 0: `CAEN_DGTZ_OpenDigitizer(CAEN_DGTZ_OpticalLink, link, node, 0)`. `true` passes the parsed base instead. Passing `0x32140000` on the direct fiber opens the wrong target. |
-| `baseline.apply_on_start` | Run `CAEN_DGTZ_Calibrate`, then a two-point DC-offset estimate and a short iterative loop. |
-| `baseline.tolerance_lsb` | Stop a channel when the measured mean is this close to the target, in ADC counts. |
-| `baseline.max_iterations`, `triggers_per_step` | Iteration cap and software triggers per measurement. |
-| `channels[].index` | `0..15`. |
-| `channels[].enabled` | Builds the `CAEN_DGTZ_SetChannelEnableMask` mask. At least one channel must be enabled. |
-| `channels[].polarity` | `"positive"` or `"negative"`. Sets `CAEN_DGTZ_SetChannelPulsePolarity` and `CAEN_DGTZ_SetTriggerPolarity` (rising for positive, falling for negative). |
-| `channels[].target_percent` | Baseline as a percent of the 14-bit range. A positive pulse usually wants a low target; a negative pulse wants a high one. |
-| `channels[].threshold` | ADC counts above a positive baseline or below a negative baseline. Used in coincidence mode, applied after the baseline measurement. |
-| `channels[].dynamic_range` | Optional per-channel `"2Vpp"` or `"0.5Vpp"`. |
-| `trigger.type` | Exactly one of `"external"`, `"rate"`, `"coincidence"`. |
-| `trigger.io_level` | `"NIM"` or `"TTL"` (`CAEN_DGTZ_SetIOLevel`). Required for external. |
-| `trigger.rate_hz` | Required for `rate`. Software-trigger period. |
-| `trigger.coincidence` | Required for `coincidence`. Ignored for the other types when the object is absent. When present it is still checked, so a template in the file must be valid. |
+Every config key is required (no hidden defaults) and is described in [docs/config.md](docs/config.md). `config/four_boards.json` is a complete example.
 
 There is no `CAEN_DGTZ_SetChannelGain` in the installed header. Dynamic range is register `0x1n28` (`0x1028` for channel 0, then +`0x100` per channel): `0` = 2 Vpp, `1` = 0.5 Vpp.
 

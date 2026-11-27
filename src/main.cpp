@@ -14,11 +14,13 @@ namespace {
 
 void usage(std::ostream& out) {
     out << "usage:\n"
-           "  icxe-daq info  --config <file>\n"
-           "  icxe-daq run   --config <file> [--max-events N]\n"
-           "  icxe-daq scope --config <file> --channel N\n"
-           "  icxe-daq reg   --config <file> --address 0xADDR [--value 0xVALUE]\n"
-           "  icxe-daq --self-test [--config <file>]\n";
+           "  icxe-daq info  --config <file> [--board NAME]\n"
+           "  icxe-daq run   --config <file> [--board NAME] [--max-events N]\n"
+           "  icxe-daq scope --config <file> [--board NAME] --channel N\n"
+           "  icxe-daq reg   --config <file> [--board NAME] --address 0xADDR [--value 0xVALUE]\n"
+           "  icxe-daq --self-test [--config <file>]\n"
+           "--board picks one entry of the config's boards list; it can be left out when the\n"
+           "config lists only one board.\n";
 }
 
 bool is_flag(const std::string& s, const char* name) {
@@ -40,6 +42,7 @@ int main(int argc, char** argv) {
         }
 
         std::string config;
+        std::string board_name;
         uint64_t max_events = 0;
         bool max_events_set = false;
         int channel = -1;
@@ -63,6 +66,14 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("--config needs a file");
                 }
                 config = argv[++i];
+            } else if (is_flag(arg, "--board")) {
+                if (self_test) {
+                    throw std::runtime_error("--board is not valid for the self-test");
+                }
+                if (i + 1 >= argc) {
+                    throw std::runtime_error("--board needs a board name");
+                }
+                board_name = argv[++i];
             } else if (is_flag(arg, "--max-events")) {
                 if (!run) {
                     throw std::runtime_error("--max-events is only valid for run");
@@ -132,7 +143,8 @@ int main(int argc, char** argv) {
         if (config.empty()) {
             throw std::runtime_error("pass --config <file>");
         }
-        const Config cfg = load_config(config);
+        const RunConfig run_config = load_config(config);
+        const Config& cfg = select_board(run_config, board_name);
         if (info) {
             command_info(cfg);
             return 0;

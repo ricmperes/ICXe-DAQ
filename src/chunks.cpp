@@ -35,24 +35,24 @@ uint64_t TimeTagUnwrapper::unwrap(uint32_t raw_ttt, int64_t read_ns) {
 }
 
 ChunkTracker::ChunkTracker(int64_t run_start_ns, int64_t acquisition_start_ns,
-                           uint32_t pre_trigger_samples)
+                           uint32_t post_trigger_samples)
     : run_start_ns_(run_start_ns),
       acquisition_start_ns_(acquisition_start_ns),
-      pre_trigger_ns_(static_cast<int64_t>(pre_trigger_samples) * kSamplePeriodNs) {}
+      post_trigger_ns_(static_cast<int64_t>(post_trigger_samples) * kSamplePeriodNs) {}
 
-int64_t ChunkTracker::waveform_start_ns(uint64_t ticks) const {
-    return acquisition_start_ns_ + static_cast<int64_t>(ticks) * kTriggerTimeTagTickNs -
-           pre_trigger_ns_;
+int64_t ChunkTracker::waveform_start_ns(uint64_t ticks, uint32_t sample_count) const {
+    return waveform_end_ns(ticks) - static_cast<int64_t>(sample_count) * kSamplePeriodNs;
 }
 
-int64_t ChunkTracker::waveform_end_ns(uint64_t ticks, uint32_t sample_count) const {
-    return waveform_start_ns(ticks) + static_cast<int64_t>(sample_count) * kSamplePeriodNs;
+int64_t ChunkTracker::waveform_end_ns(uint64_t ticks) const {
+    return acquisition_start_ns_ + static_cast<int64_t>(ticks) * kTriggerTimeTagTickNs +
+           post_trigger_ns_;
 }
 
 void ChunkTracker::add_event(int file_index, const std::string& file, uint32_t event_counter,
                              uint64_t ticks, uint32_t sample_count) {
-    const int64_t wf_start = waveform_start_ns(ticks);
-    const int64_t wf_end = waveform_end_ns(ticks, sample_count);
+    const int64_t wf_start = waveform_start_ns(ticks, sample_count);
+    const int64_t wf_end = waveform_end_ns(ticks);
 
     if (chunks_.empty() || chunks_.back().index != file_index) {
         int64_t start = 0;
