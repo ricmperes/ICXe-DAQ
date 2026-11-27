@@ -442,13 +442,18 @@ public:
         std::fprintf(out, "channels_shut_down: %s\n",
                      health.status.are_channels_shut_down ? "yes" : "no");
         std::fprintf(out, "board_failure_0x8178: %s\n", hex32(health.failure.raw).c_str());
+        std::fprintf(out, "pll_lock_loss: %s\n", health.failure.has_pll_lock_loss ? "yes" : "no");
+        std::fprintf(out, "temperature_failure: %s\n",
+                     health.failure.has_temperature_failure ? "yes" : "no");
+        std::fprintf(out, "adc_power_down: %s\n",
+                     health.failure.has_adc_power_down ? "yes" : "no");
         std::fprintf(out, "adc_temperatures_celsius:");
         for (const int temperature : health.adc_temperatures_celsius) {
             std::fprintf(out, " %d", temperature);
         }
         std::fprintf(out, "\n");
         for (const std::string& problem :
-             status_problems(health.status, {cfg_.clock_source, false, false})) {
+             health_problems(health.status, health.failure, {cfg_.clock_source, false, false})) {
             std::fprintf(out, "status_problem: %s\n", problem.c_str());
         }
         std::fflush(out);
@@ -457,7 +462,7 @@ public:
     // Before the first write: a wrong clock or channels in shutdown cannot be fixed by
     // programming the board.
     void check_status_before_writing() {
-        require_status(read_fresh_status(), {cfg_.clock_source, false, false},
+        require_status(read_fresh_status(), read_failure(), {cfg_.clock_source, false, false},
                        "before programming");
     }
 
@@ -466,7 +471,8 @@ public:
     void check_status_before_start() {
         health_start_ = read_health();
         health_start_->status = read_fresh_status();
-        require_status(health_start_->status, {cfg_.clock_source, true, false}, "before start");
+        require_status(health_start_->status, health_start_->failure,
+                       {cfg_.clock_source, true, false}, "before start");
         std::fprintf(stderr,
                      "status: %s 0x8104=%s clock %s, ready; 0x8178=%s; ADC temperatures %s\n",
                      cfg_.board_name.c_str(), hex32(health_start_->status.raw).c_str(),
@@ -1078,12 +1084,16 @@ private:
         return read_status();
     }
 
+    BoardFailureStatus read_failure() {
+        uint32_t raw = 0;
+        check(CAEN_DGTZ_ReadRegister(handle_, 0x8178, &raw), "read board failure 0x8178");
+        return decode_board_failure_status(raw);
+    }
+
     BoardHealth read_health() {
         BoardHealth health;
         health.status = read_status();
-        uint32_t failure = 0;
-        check(CAEN_DGTZ_ReadRegister(handle_, 0x8178, &failure), "read board failure 0x8178");
-        health.failure = decode_board_failure_status(failure);
+        health.failure = read_failure();
         for (uint32_t ch = 0; ch < board_.channels; ++ch) {
             uint32_t raw = 0;
             check(CAEN_DGTZ_ReadRegister(handle_, 0x10A8u | (ch << 8), &raw),
@@ -1105,7 +1115,8 @@ private:
     std::vector<std::string> check_status_during_run() {
         ++status_checks_during_run_;
         const AcquisitionStatus status = read_status();
-        return status_problems(status, {cfg_.clock_source, false, is_running_bit_reliable_});
+        return health_problems(status, read_failure(),
+                               {cfg_.clock_source, false, is_running_bit_reliable_});
     }
 
     std::string status_problem_message(const std::string& when) const {
@@ -1116,12 +1127,13 @@ private:
         return message;
     }
 
-    void require_status(const AcquisitionStatus& status, const StatusExpectation& expectation,
-                        const std::string& when) {
-        status_problems_ = status_problems(status, expectation);
+    void require_status(const AcquisitionStatus& status, const BoardFailureStatus& failure,
+                        const StatusExpectation& expectation, const std::string& when) {
+        status_problems_ = health_problems(status, failure, expectation);
         if (!status_problems_.empty()) {
             throw std::runtime_error(status_problem_message(when + " (0x8104=" +
-                                                            hex32(status.raw) + ")"));
+                                                            hex32(status.raw) + ", 0x8178=" +
+                                                            hex32(failure.raw) + ")"));
         }
     }
 

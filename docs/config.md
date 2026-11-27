@@ -18,11 +18,11 @@ Complete example: `config/four_boards.json`. The other files in `config/`: `over
 
 What the program does with the keys, in this order, so the descriptions below can refer to it:
 
-1. Open the board (connection, `boards[].vme_base_address`), check that it reports `boards[].serial` and is not protected, and check its status (clock source as `boards[].clock_source`, channels not in over-temperature shutdown, PLL locked). Nothing is written before these checks pass.
+1. Open the board (connection, `boards[].vme_base_address`), check that it reports `boards[].serial` and is not protected, and check its status (clock source as `boards[].clock_source`, channels not in over-temperature shutdown, PLL locked; register 0x8104) and its failure register (no PLL lock loss, temperature failure or ADC power down; register 0x8178). Nothing is written before these checks pass.
 2. Reset the board, then program record length, pre-trigger, buffers, I/O level, enabled channels, polarity, dynamic range and the nominal DC offset of each enabled channel.
 3. Baseline step (`baseline`): ADC calibration, then the DC offset is adjusted until each channel sits at its `target_percent`. Uses software triggers; nothing is written to disk.
 4. Arm the trigger (`trigger`, `boards[].coincidence`), then `trigger_requests`, `analog_monitor`, `accept_overlapping_triggers`, `register_writes`, in this order. Every register written here is read back; the values go to stderr and `metadata.json`.
-5. Check the status once more (now also "board ready"), record temperatures, then acquire and write files until a stop condition (`duration_s`, `--max-events`, Ctrl-C). The status is checked once per second; a problem (over-temperature, shutdown, clock or PLL) stops the run with `stop_reason` `board_status` ([data_format.md](data_format.md)).
+5. Check the status once more (now also "board ready"), record temperatures, then acquire and write files until a stop condition (`duration_s`, `--max-events`, Ctrl-C). The status (0x8104 and 0x8178) is checked once per second; a problem (over-temperature, shutdown, ADCs powered down, clock or PLL) stops the run with `stop_reason` `board_status` ([data_format.md](data_format.md)).
 
 ## Shared keys
 

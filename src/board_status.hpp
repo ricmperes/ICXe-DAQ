@@ -55,6 +55,15 @@ std::string overheated_channels_text(uint32_t overheated_mezzanines);
 std::vector<std::string> status_problems(const AcquisitionStatus& status,
                                          const StatusExpectation& expectation);
 
+// Problems of a decoded 0x8178 value, each as one sentence for the user. Empty when no
+// failure flag is set.
+std::vector<std::string> failure_problems(const BoardFailureStatus& failure);
+
+// Problems of 0x8104 against the expectation, followed by those of 0x8178.
+std::vector<std::string> health_problems(const AcquisitionStatus& status,
+                                         const BoardFailureStatus& failure,
+                                         const StatusExpectation& expectation);
+
 // Why the opened board must not be touched: serial differs from the config, or
 // it is a protected board. Empty when it is the configured board.
 std::optional<std::string> identity_problem(const BoardIdentity& identity,

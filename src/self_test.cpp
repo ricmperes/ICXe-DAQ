@@ -795,7 +795,26 @@ void test_board_status() {
     const BoardFailureStatus failure = decode_board_failure_status(0x70u);
     CHECK(failure.has_pll_lock_loss && failure.has_temperature_failure &&
           failure.has_adc_power_down);
+    CHECK(failure_problems(failure).size() == 3);
     CHECK(!decode_board_failure_status(0x0u).has_temperature_failure);
+    CHECK(failure_problems(decode_board_failure_status(0x0u)).empty());
+
+    // B1 and B3 after shutting themselves down, 2c.3 (0x8104=0x80180 / 0x801A0, 0x8178=0x40),
+    // against B2 running (0x1A0, 0x0).
+    const BoardFailureStatus adcs_off = decode_board_failure_status(0x40u);
+    CHECK(adcs_off.has_adc_power_down && !adcs_off.has_temperature_failure &&
+          !adcs_off.has_pll_lock_loss);
+    const std::vector<std::string> b1_problems = health_problems(
+        decode_acquisition_status(0x80180u), adcs_off, {ClockSource::Internal, false, false});
+    CHECK(b1_problems.size() == 2 && has_problem_with(b1_problems, "shutdown") &&
+          has_problem_with(b1_problems, "latched") &&
+          has_problem_with(b1_problems, "ADCs are powered down"));
+    CHECK(health_problems(decode_acquisition_status(0x801A0u), adcs_off,
+                          {ClockSource::External, false, false})
+              .size() == 2);
+    CHECK(health_problems(decode_acquisition_status(0x1A0u), decode_board_failure_status(0x0u),
+                          {ClockSource::External, true, false})
+              .empty());
 
     CHECK(decode_adc_temperature(0x2Du) == 45);
     CHECK(decode_adc_temperature(0xC0u) == -64);
@@ -849,6 +868,18 @@ void test_board_status() {
         CHECK(problems.size() == expected_count);
         CHECK(has_problem_with(problems, "clock source") ==
               (status.is_clock_external != wants_external));
+        const BoardFailureStatus random_failure = decode_board_failure_status(raw);
+        CHECK(random_failure.raw == raw);
+        CHECK(random_failure.has_pll_lock_loss == (((raw >> 4) & 1u) != 0u));
+        CHECK(random_failure.has_temperature_failure == (((raw >> 5) & 1u) != 0u));
+        CHECK(random_failure.has_adc_power_down == (((raw >> 6) & 1u) != 0u));
+        const std::size_t expected_failure_count =
+            (random_failure.has_pll_lock_loss ? 1u : 0u) +
+            (random_failure.has_temperature_failure ? 1u : 0u) +
+            (random_failure.has_adc_power_down ? 1u : 0u);
+        CHECK(failure_problems(random_failure).size() == expected_failure_count);
+        CHECK(health_problems(status, random_failure, expectation).size() ==
+              expected_count + expected_failure_count);
         const int temperature = decode_adc_temperature(raw);
         CHECK(temperature >= -128 && temperature <= 127);
         CHECK((static_cast<uint32_t>(temperature) & 0xffu) == (raw & 0xffu));

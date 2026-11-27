@@ -1,6 +1,7 @@
 #include "board_status.hpp"
 
 #include <algorithm>
+#include <utility>
 
 namespace {
 
@@ -59,9 +60,11 @@ std::vector<std::string> status_problems(const AcquisitionStatus& status,
     }
     if (status.are_channels_shut_down) {
         problems.push_back(
-            "channels are in over-temperature shutdown (0x8104 bit 19): they stay off until the "
-            "board is below 74 °C and the shutdown is cleared (0x81C0 bit 0, or a crate power "
-            "cycle as for B3 in PLAN.md 2b)");
+            "channels are in shutdown (0x8104 bit 19), the over-temperature protection: the "
+            "board was above 85 °C at some time. The shutdown is latched, so it stays after the "
+            "board has cooled down, and the ADC temperatures are then lower than on a running "
+            "board because the ADCs are off. Check the crate cooling, then clear it with 0x81C0 "
+            "bit 0 (board below 74 °C) or a crate power cycle");
     }
     const bool wants_external = expectation.clock_source == ClockSource::External;
     if (status.is_clock_external != wants_external) {
@@ -84,6 +87,33 @@ std::vector<std::string> status_problems(const AcquisitionStatus& status,
         problems.push_back(
             "the board stopped its acquisition by itself (0x8104 bit 2 is 0), e.g. by its "
             "over-temperature protection");
+    }
+    return problems;
+}
+
+std::vector<std::string> failure_problems(const BoardFailureStatus& failure) {
+    std::vector<std::string> problems;
+    if (failure.has_pll_lock_loss) {
+        problems.push_back("PLL lock loss (0x8178 bit 4): the board lost its sampling clock; "
+                           "check the CLK-IN cable and the board before it in the chain");
+    }
+    if (failure.has_temperature_failure) {
+        problems.push_back("temperature failure (0x8178 bit 5): the board reports an "
+                           "over-temperature; check the crate cooling");
+    }
+    if (failure.has_adc_power_down) {
+        problems.push_back("ADCs are powered down (0x8178 bit 6): the channels record nothing; "
+                           "this comes with the over-temperature shutdown (0x8104 bit 19)");
+    }
+    return problems;
+}
+
+std::vector<std::string> health_problems(const AcquisitionStatus& status,
+                                         const BoardFailureStatus& failure,
+                                         const StatusExpectation& expectation) {
+    std::vector<std::string> problems = status_problems(status, expectation);
+    for (std::string& problem : failure_problems(failure)) {
+        problems.push_back(std::move(problem));
     }
     return problems;
 }
