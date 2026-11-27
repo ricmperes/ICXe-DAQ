@@ -73,5 +73,11 @@ std::optional<std::string> identity_problem(const BoardIdentity& identity,
 // Boards of one run must run the same ROC and AMC firmware. Empty when they do.
 std::optional<std::string> firmware_mismatch(const std::vector<BoardIdentity>& boards);
 
+// Status checks during a run follow a fixed schedule from the start of acquisition
+// (1 s, 2 s, ...), independent of file changes. Given the time the check was due and the
+// time it ran (seconds since start), returns when the next one is due; after a late check
+// (more than one period), it is due one period after the check that ran.
+double next_status_check_time(double due_s, double checked_s, double period_s);
+
 // Register 0x1nA8 bits[7:0]: signed ADC chip temperature in °C.
 int decode_adc_temperature(uint32_t raw);

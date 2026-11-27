@@ -130,7 +130,7 @@ The clock is the PC wall clock, so its accuracy is that of the host time sync (N
 | `stop_conditions.max_events` | `null` | `--max-events N` of the run, `null` when not given. |
 | `board_health.start` | object | Board state just before the acquisition starts: `acquisition_status_0x8104` (raw value and decoded flags: running, memory full, external clock, PLL lock kept, board ready, channels shut down, overheated channels), `board_failure_status_0x8178` (raw value and PLL lock loss, temperature failure, ADC power down), and `adc_temperatures_celsius` (16 values, ADC chip temperature of each channel, register 0x1nA8). |
 | `board_health.end` | object or `null` | Same, read after the acquisition stopped. `null` while the run is in progress, or when the board could not be read at the end. |
-| `board_health.status_checks_during_run` | `61` | How many times 0x8104 and 0x8178 were checked during the run (once per second). |
+| `board_health.status_checks_during_run` | `61` | How many times 0x8104 and 0x8178 were checked during the run. The checks are due at 1 s, 2 s, ... after the start of acquisition, so a 10 s run has 9 or 10. |
 | `board_health.problems` | `[]` | Problems found by the last check (0x8104 and 0x8178), one sentence each. Empty for a run that ended normally. |
 
 The board protects itself above 85 °C (V1730S): it turns off the channels of the hot 4-channel group and stops its acquisition (UM5118, 0x8104 bits 23:20 and 19). The status checks stop the run with `stop_reason` `board_status` when that happens, when the clock source differs from `boards[].clock_source`, or when the PLL loses lock.

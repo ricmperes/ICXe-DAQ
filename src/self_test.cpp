@@ -754,6 +754,36 @@ bool has_problem_with(const std::vector<std::string>& problems, const std::strin
     });
 }
 
+void test_status_check_schedule() {
+    CHECK(next_status_check_time(1.0, 1.0, 1.0) == 2.0);
+    CHECK(next_status_check_time(1.0, 1.3, 1.0) == 2.0);
+    CHECK(next_status_check_time(2.0, 3.5, 1.0) == 4.5);
+
+    // Run of 10 s as in 2c.3 with a file change at 5 s: the check runs once per due time,
+    // at 1 s, 2 s, ..., 9 s (and 10 s when the loop gets there before the duration stop).
+    double due_s = 1.0;
+    int checks = 0;
+    for (double run_time_s = 0.0; run_time_s < 10.0; run_time_s += 0.0003) {
+        if (run_time_s >= due_s) {
+            due_s = next_status_check_time(due_s, run_time_s, 1.0);
+            ++checks;
+        }
+    }
+    CHECK(checks == 9 || checks == 10);
+
+    std::mt19937 generator(20261127u);
+    std::uniform_real_distribution<double> any_time(0.0, 1e5);
+    std::uniform_real_distribution<double> any_delay(0.0, 5.0);
+    for (int trial = 0; trial < 5000; ++trial) {
+        const double due = any_time(generator);
+        const double checked = due + any_delay(generator);
+        const double next = next_status_check_time(due, checked, 1.0);
+        CHECK(next > checked);
+        CHECK(next <= checked + 1.0);
+        CHECK(checked - due >= 1.0 || next == due + 1.0);
+    }
+}
+
 void test_duration_option(const fs::path& dir) {
     CHECK(parse_duration_option("10") == 10.0);
     CHECK(parse_duration_option("2.5") == 2.5);
@@ -1055,6 +1085,7 @@ int run_self_test(const std::string& config_path) {
         test_common_sample_count();
         test_sample_count_summary();
         test_board_status();
+        test_status_check_schedule();
         test_coincidence();
         test_config(dir);
         test_every_key_required(dir);

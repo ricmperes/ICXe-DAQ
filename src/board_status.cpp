@@ -151,6 +151,11 @@ std::optional<std::string> firmware_mismatch(const std::vector<BoardIdentity>& b
     return std::nullopt;
 }
 
+double next_status_check_time(double due_s, double checked_s, double period_s) {
+    const double next_due_s = due_s + period_s;
+    return next_due_s > checked_s ? next_due_s : checked_s + period_s;
+}
+
 int decode_adc_temperature(uint32_t raw) {
     return static_cast<int>(static_cast<int8_t>(raw & 0xffu));
 }

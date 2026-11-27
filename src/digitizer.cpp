@@ -25,6 +25,8 @@ using json = nlohmann::json;
 
 namespace {
 
+constexpr double kStatusCheckPeriodS = 1.0;
+
 volatile std::sig_atomic_t g_stop_signal = 0;
 
 void on_stop_signal(int sig) {
@@ -854,7 +856,7 @@ public:
         ensure_readout();
         check(CAEN_DGTZ_ClearData(handle_), "ClearData");
         const timespec start = mono_now();
-        timespec last_status = start;
+        double next_status_check_s = kStatusCheckPeriodS;
         int last_file = 0;
         start_sw("run");
         // The trigger time tag counts from this start. acq_start_ns_ is taken
@@ -916,8 +918,11 @@ public:
                     break;
                 }
                 const bool file_changed = writer.file_index() != last_file;
-                const bool is_status_due = elapsed_s(mono_now(), last_status) >= 1.0;
+                const double run_time_s = elapsed_s(mono_now(), start);
+                const bool is_status_due = run_time_s >= next_status_check_s;
                 if (is_status_due) {
+                    next_status_check_s = next_status_check_time(next_status_check_s, run_time_s,
+                                                                 kStatusCheckPeriodS);
                     status_problems_ = check_status_during_run();
                     if (!status_problems_.empty()) {
                         stop = "board_status";
@@ -933,7 +938,6 @@ public:
                                  writer.file_index());
                     std::fflush(stdout);
                     last_file = writer.file_index();
-                    last_status = mono_now();
                 }
                 if (n == 0) {
                     timespec wake = mono_now();
@@ -1013,20 +1017,22 @@ public:
         const bool rate = cfg_.trigger == TriggerType::Rate;
         const int64_t period_ns = rate ? std::llround(1e9 / cfg_.rate_hz) : 0;
 
-        timespec last_status = start;
+        double next_status_check_s = kStatusCheckPeriodS;
         while (!g_stop_signal) {
             const timespec now = mono_now();
             if (cfg_.duration_s > 0.0 && elapsed_s(now, start) >= cfg_.duration_s) {
                 break;
             }
-            if (elapsed_s(now, last_status) >= 1.0) {
+            const double scope_time_s = elapsed_s(now, start);
+            if (scope_time_s >= next_status_check_s) {
+                next_status_check_s = next_status_check_time(next_status_check_s, scope_time_s,
+                                                             kStatusCheckPeriodS);
                 status_problems_ = check_status_during_run();
                 if (!status_problems_.empty()) {
                     CAEN_DGTZ_SWStopAcquisition(handle_);
                     acq_on_ = false;
                     throw std::runtime_error(status_problem_message("during scope"));
                 }
-                last_status = now;
             }
             if (rate && ts_ge(now, next_trigger)) {
                 check(CAEN_DGTZ_SendSWtrigger(handle_), "SendSWtrigger");
