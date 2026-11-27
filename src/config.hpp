@@ -84,6 +84,8 @@ struct Config {
     std::string name = "run";
     std::string output_directory = "data";
     double duration_s = 0;
+    // Set by --duration S of run / scope (then duration_s holds S); not a JSON key.
+    std::optional<double> duration_s_from_command_line;
     uint32_t waveforms_per_file = 1000;
     uint32_t record_length = 0;
     uint32_t pre_trigger_samples = 0;
@@ -123,6 +125,10 @@ const char* to_string(MonitorMode mode);
 uint32_t monitor_mode_bits(MonitorMode mode);
 // Accepts a 32-bit integer as "0x..." hex or decimal text.
 uint32_t parse_u32_auto(const std::string& text, const char* what);
+// Value of --duration: a finite number of seconds > 0, e.g. "10" or "2.5".
+double parse_duration_option(const std::string& text);
+// The config with duration_s replaced by the --duration value, when one was given.
+Config with_duration_option(Config cfg, std::optional<double> duration_s);
 
 bool link_type_known(const std::string& link_type);
 bool link_type_implemented(const std::string& link_type);

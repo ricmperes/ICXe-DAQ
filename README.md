@@ -27,6 +27,7 @@ The self-test checks buffer-organization choice, JSON loading, and a waveform-fi
 ./build/icxe-daq info  --config config/four_boards.json --board B1
 ./build/icxe-daq run   --config config/overlap_on.json
 ./build/icxe-daq run   --config config/overlap_on.json --max-events 100
+./build/icxe-daq run   --config config/overlap_on.json --duration 10
 ./build/icxe-daq scope --config config/four_boards.json --board B2 --channel 0
 ./build/icxe-daq reg   --config config/four_boards.json --board B3 --address 0x1070 [--value 0x7D]
 ```
@@ -39,7 +40,7 @@ A config lists one or more boards ([docs/config.md](docs/config.md)). `--board N
 
 On 2026-10-26 `info` opened the V1730SB (serial 30176, 16 channels, standard waveform firmware, ROC `04.29 - Build 8716`, AMC `00.05 - Build 9130`). Board info `0x8140` was `0x10080b` (memory size field 8; this board's SRAM is 5.12 MS/channel). A following `run` programmed a 1020-sample record, then `CAEN_DGTZ_SWStartAcquisition` returned `CAEN_DGTZ_CommError` because acquisition status `0x8104` stayed 0. No waveform file was written. See [docs/smoke.md](docs/smoke.md).
 
-`run` writes a run directory and does not plot. `scope` does not write run files. It streams one channel on stdout for an oscilloscope. Both stop on `duration_s`, and `run` also stops on `--max-events`. SIGINT and SIGTERM close the run cleanly (`stop=sigint` or `stop=sigterm`).
+`run` writes a run directory and does not plot. `scope` does not write run files. It streams one channel on stdout for an oscilloscope. Both stop on `duration_s`, or on `--duration S` when it is given (it replaces `duration_s` for that run), and `run` also stops on `--max-events`. The limits a run used are in its metadata (`stop_conditions`). SIGINT and SIGTERM close the run cleanly (`stop=sigint` or `stop=sigterm`).
 
 Only the main thread calls the digitizer. A rate trigger is `CAEN_DGTZ_SendSWtrigger` on that same thread, paced with `clock_nanosleep`. The optical readout adds jitter. There is no internal periodic-trigger register. If the loop falls behind, missed periods are skipped rather than fired in a burst.
 

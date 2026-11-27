@@ -15,12 +15,13 @@ namespace {
 void usage(std::ostream& out) {
     out << "usage:\n"
            "  icxe-daq info  --config <file> [--board NAME]\n"
-           "  icxe-daq run   --config <file> [--board NAME] [--max-events N]\n"
-           "  icxe-daq scope --config <file> [--board NAME] --channel N\n"
+           "  icxe-daq run   --config <file> [--board NAME] [--max-events N] [--duration S]\n"
+           "  icxe-daq scope --config <file> [--board NAME] --channel N [--duration S]\n"
            "  icxe-daq reg   --config <file> [--board NAME] --address 0xADDR [--value 0xVALUE]\n"
            "  icxe-daq --self-test [--config <file>]\n"
            "--board picks one entry of the config's boards list; it can be left out when the\n"
-           "config lists only one board.\n";
+           "config lists only one board. --duration S replaces duration_s of the config\n"
+           "(seconds, > 0) for this run.\n";
 }
 
 bool is_flag(const std::string& s, const char* name) {
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
         std::string board_name;
         uint64_t max_events = 0;
         bool max_events_set = false;
+        std::optional<double> duration_s;
         int channel = -1;
         bool channel_set = false;
         bool self_test = cmd == "--self-test" || cmd == "self-test";
@@ -89,6 +91,14 @@ int main(int argc, char** argv) {
                 }
                 max_events = static_cast<uint64_t>(n);
                 max_events_set = true;
+            } else if (is_flag(arg, "--duration")) {
+                if (!run && !scope) {
+                    throw std::runtime_error("--duration is only valid for run and scope");
+                }
+                if (i + 1 >= argc) {
+                    throw std::runtime_error("--duration needs a number of seconds");
+                }
+                duration_s = parse_duration_option(argv[++i]);
             } else if (is_flag(arg, "--channel")) {
                 if (!scope) {
                     throw std::runtime_error("--channel is only valid for scope");
@@ -144,7 +154,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("pass --config <file>");
         }
         const RunConfig run_config = load_config(config);
-        const Config& cfg = select_board(run_config, board_name);
+        const Config cfg = with_duration_option(select_board(run_config, board_name), duration_s);
         if (info) {
             command_info(cfg);
             return 0;

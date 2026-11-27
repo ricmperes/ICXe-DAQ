@@ -840,6 +840,11 @@ public:
         const UtcStamp started = utc_now_stamp();
         std::string stop = "error";
         json meta = make_metadata(started);
+        meta["stop_conditions"] = {
+            {"duration_s", cfg_.duration_s > 0.0 ? json(cfg_.duration_s) : json(nullptr)},
+            {"duration_s_source",
+             cfg_.duration_s_from_command_line ? "command line --duration" : "config duration_s"},
+            {"max_events", max_events > 0 ? json(max_events) : json(nullptr)}};
         write_metadata(run_dir / "metadata.json", meta);
 
         std::fprintf(stdout, "directory=%s\n", run_dir.string().c_str());
@@ -1895,7 +1900,7 @@ private:
             {"status_checks_during_run", 0},
             {"problems", json::array()},
             {"note", "start: just before the acquisition starts; end: after it stopped. "
-                     "0x8104 is checked once per second during the run."}};
+                     "0x8104 and 0x8178 are checked once per second during the run."}};
         return meta;
     }
 

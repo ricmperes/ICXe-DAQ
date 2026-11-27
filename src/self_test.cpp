@@ -754,6 +754,37 @@ bool has_problem_with(const std::vector<std::string>& problems, const std::strin
     });
 }
 
+void test_duration_option(const fs::path& dir) {
+    CHECK(parse_duration_option("10") == 10.0);
+    CHECK(parse_duration_option("2.5") == 2.5);
+    CHECK(parse_duration_option("1e3") == 1000.0);
+    for (const std::string bad : {"", "0", "-1", "10s", "ten", "nan", "inf", " 10", "1e999"}) {
+        CHECK(throws_with([&] { parse_duration_option(bad); }, "--duration must be"));
+    }
+
+    const RunConfig run = load_json(dir / "duration_fixture.json", single_board_config());
+    const Config& from_file = select_board(run, "B1");
+    CHECK(from_file.duration_s == 0.0 && !from_file.duration_s_from_command_line);
+    const Config unchanged = with_duration_option(from_file, std::nullopt);
+    CHECK(unchanged.duration_s == 0.0 && !unchanged.duration_s_from_command_line);
+    const Config ten_seconds = with_duration_option(from_file, 10.0);
+    CHECK(ten_seconds.duration_s == 10.0 && ten_seconds.duration_s_from_command_line == 10.0);
+    CHECK(ten_seconds.record_length == from_file.record_length);
+    CHECK(ten_seconds.board_name == from_file.board_name);
+
+    std::mt19937 generator(20261127u);
+    std::uniform_real_distribution<double> any_seconds(1e-3, 1e6);
+    for (int trial = 0; trial < 1000; ++trial) {
+        const double seconds = any_seconds(generator);
+        char text[64];
+        std::snprintf(text, sizeof(text), "%.17g", seconds);
+        CHECK(parse_duration_option(text) == seconds);
+        CHECK(throws_with([&] { parse_duration_option("-" + std::string(text)); },
+                          "--duration must be"));
+        CHECK(with_duration_option(from_file, seconds).duration_s == seconds);
+    }
+}
+
 void test_board_status() {
     // Values read on the bench in step 2b.
     const AcquisitionStatus master = decode_acquisition_status(0x180u);
@@ -1028,6 +1059,7 @@ int run_self_test(const std::string& config_path) {
         test_config(dir);
         test_every_key_required(dir);
         test_run_config(dir);
+        test_duration_option(dir);
         test_bench_keys(dir);
         test_writer(dir);
     } catch (const std::exception& ex) {

@@ -22,7 +22,7 @@ What the program does with the keys, in this order, so the descriptions below ca
 2. Reset the board, then program record length, pre-trigger, buffers, I/O level, enabled channels, polarity, dynamic range and the nominal DC offset of each enabled channel.
 3. Baseline step (`baseline`): ADC calibration, then the DC offset is adjusted until each channel sits at its `target_percent`. Uses software triggers; nothing is written to disk.
 4. Arm the trigger (`trigger`, `boards[].coincidence`), then `trigger_requests`, `analog_monitor`, `accept_overlapping_triggers`, `register_writes`, in this order. Every register written here is read back; the values go to stderr and `metadata.json`.
-5. Check the status once more (now also "board ready"), record temperatures, then acquire and write files until a stop condition (`duration_s`, `--max-events`, Ctrl-C). The status (0x8104 and 0x8178) is checked once per second; a problem (over-temperature, shutdown, ADCs powered down, clock or PLL) stops the run with `stop_reason` `board_status` ([data_format.md](data_format.md)).
+5. Check the status once more (now also "board ready"), record temperatures, then acquire and write files until a stop condition (`duration_s` or `--duration`, `--max-events`, Ctrl-C). The status (0x8104 and 0x8178) is checked once per second; a problem (over-temperature, shutdown, ADCs powered down, clock or PLL) stops the run with `stop_reason` `board_status` ([data_format.md](data_format.md)).
 
 ## Shared keys
 
@@ -35,7 +35,7 @@ What the program does with the keys, in this order, so the descriptions below ca
 | `duration_s` | number | `>= 0` | Length of the acquisition in seconds, counted from the start of acquisition (the baseline step before it does not count). `0` means no time limit: the run then stops only on `--max-events N` or Ctrl-C / SIGTERM. |
 | `waveforms_per_file` | integer | `>= 1` | Number of events in one waveform file `wf_XXXXX.bin` (one chunk). When a file is full, the next one is opened. Small values give many small chunks; each chunk gets its own start and end time in the metadata. |
 
-`run --max-events N` (`N >= 1`), SIGINT, and SIGTERM also stop a run. They are not JSON keys. `scope` uses `duration_s` and the signals, and ignores `--max-events`.
+`run --max-events N` (`N >= 1`), SIGINT, and SIGTERM also stop a run. They are not JSON keys. `--duration S` (`run` and `scope`, seconds `> 0`, e.g. `10` or `2.5`) replaces `duration_s` for that run, so the same config can be used for runs of different length. The copy `config.json` in the run directory still shows the file's `duration_s`; the limits actually used are in the metadata, `stop_conditions` ([data_format.md](data_format.md)). `scope` ignores `--max-events`.
 
 ### Record and buffer
 

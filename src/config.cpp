@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <set>
@@ -110,6 +111,35 @@ uint32_t parse_u32_auto(const std::string& text, const char* what) {
     } catch (const std::exception&) {
         throw std::runtime_error(std::string("bad ") + what + " \"" + text + "\"");
     }
+}
+
+double parse_duration_option(const std::string& text) {
+    const std::string message = "--duration must be a number of seconds > 0, got \"" + text + "\"";
+    if (text.empty() || std::isspace(static_cast<unsigned char>(text.front())) != 0) {
+        throw std::runtime_error(message);
+    }
+    double seconds = 0;
+    try {
+        std::size_t idx = 0;
+        seconds = std::stod(text, &idx);
+        if (idx != text.size()) {
+            throw std::runtime_error(message);
+        }
+    } catch (const std::exception&) {
+        throw std::runtime_error(message);
+    }
+    if (!std::isfinite(seconds) || seconds <= 0.0) {
+        throw std::runtime_error(message);
+    }
+    return seconds;
+}
+
+Config with_duration_option(Config cfg, std::optional<double> duration_s) {
+    if (duration_s) {
+        cfg.duration_s = *duration_s;
+        cfg.duration_s_from_command_line = duration_s;
+    }
+    return cfg;
 }
 
 namespace {
