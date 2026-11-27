@@ -6,13 +6,11 @@
   "record_length": 1020,
   "pre_trigger_samples": 500,
   "n_buffers": null,
-  "dynamic_range": "2Vpp",
   "max_events_blt": 32,
   "connection": {
     "link_type": "optical",
     "link_num": 0,
     "conet_node": 0,
-    "vme_base_address": "0x32140000",
     "use_vme_base_address": false
   },
   "baseline": {
@@ -21,35 +19,57 @@
     "max_iterations": 12,
     "triggers_per_step": 8
   },
-  "channels": [
-    {
-      "index": 0,
-      "enabled": true,
-      "polarity": "negative",
-      "target_percent": 85,
-      "threshold": 10
-    },
-    {
-      "index": 1,
-      "enabled": true,
-      "polarity": "negative",
-      "target_percent": 15,
-      "threshold": 100
-    }
-  ],
   "trigger": {
     "type": "coincidence",
     "io_level": "TTL",
-    "rate_hz": 10,
-    "coincidence": {
-      "majority": 0,
-      "window_ns": 48,
-      "pairs": [
-        {
-          "channels": [0, 1],
-          "logic": "or"
-        }
+    "rate_hz": 10
+  },
+  "accept_overlapping_triggers": false,
+  "trigger_requests": null,
+  "analog_monitor": null,
+  "register_writes": [],
+  "protected_serials": [
+    30176
+  ],
+  "boards": [
+    {
+      "name": "B5",
+      "vme_base_address": "0x32140000",
+      "serial": 30176,
+      "clock_source": "internal",
+      "coincidence": {
+        "majority": 0,
+        "window_ns": 48,
+        "pairs": [
+          {
+            "channels": [
+              0,
+              1
+            ],
+            "logic": "or"
+          }
+        ]
+      },
+      "trigger_request_channels": [],
+      "register_writes": [],
+      "channels": [
+        {"index": 0, "enabled": true, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 1, "enabled": true, "polarity": "negative", "target_percent": 15, "threshold": 100, "dynamic_range": "2Vpp"},
+        {"index": 2, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 3, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 4, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 5, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 6, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 7, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 8, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 9, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 10, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 11, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 12, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 13, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 14, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"},
+        {"index": 15, "enabled": false, "polarity": "negative", "target_percent": 85, "threshold": 10, "dynamic_range": "2Vpp"}
       ]
     }
-  }
+  ]
 }

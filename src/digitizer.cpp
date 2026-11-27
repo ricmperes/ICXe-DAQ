@@ -1,5 +1,7 @@
 #include "digitizer.hpp"
 
+#include "board_status.hpp"
+#include "chunks.hpp"
 #include "util.hpp"
 #include "writer.hpp"
 
@@ -7,12 +9,14 @@
 
 #include <CAENDigitizer.h>
 
+#include <algorithm>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -20,6 +24,8 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace {
+
+constexpr double kStatusCheckPeriodS = 1.0;
 
 volatile std::sig_atomic_t g_stop_signal = 0;
 
@@ -180,6 +186,28 @@ struct PairReadback {
     uint32_t logic_bits = 0;
 };
 
+// One register access: value before, value written, and readback.
+struct RegisterAccess {
+    uint32_t address = 0;
+    uint32_t before = 0;
+    uint32_t written = 0;
+    uint32_t after = 0;
+    uint32_t mask = 0xffffffffu;
+    bool wrote = false;
+    bool matches() const { return !wrote || (after & mask) == (written & mask); }
+};
+
+json register_access_json(const RegisterAccess& a) {
+    json j = {{"address", hex32(a.address)}, {"before", hex32(a.before)}};
+    if (a.wrote) {
+        j["written"] = hex32(a.written);
+        j["mask"] = hex32(a.mask);
+        j["readback"] = hex32(a.after);
+        j["readback_matches"] = a.matches();
+    }
+    return j;
+}
+
 struct Accum {
     double sum = 0;
     double sumsq = 0;
@@ -205,6 +233,75 @@ struct Accum {
         n = 0;
     }
 };
+
+json sample_counts_json(const SampleCountSummary& summary) {
+    const auto optional_count = [](std::optional<uint32_t> value) {
+        return value ? json(*value) : json(nullptr);
+    };
+    return json{{"minimum", optional_count(summary.minimum())},
+                {"maximum", optional_count(summary.maximum())},
+                {"events_shorter_than_record", summary.events_shorter_than_record()},
+                {"events_longer_than_record", summary.events_longer_than_record()}};
+}
+
+json acquisition_status_json(const AcquisitionStatus& status) {
+    return {{"raw", hex32(status.raw)},
+            {"is_running", status.is_running},
+            {"is_memory_full", status.is_memory_full},
+            {"is_clock_external", status.is_clock_external},
+            {"is_pll_lock_kept", status.is_pll_lock_kept},
+            {"is_board_ready", status.is_board_ready},
+            {"are_channels_shut_down", status.are_channels_shut_down},
+            {"overheated_channels", overheated_channels_text(status.overheated_mezzanines)}};
+}
+
+json board_failure_json(const BoardFailureStatus& failure) {
+    return {{"raw", hex32(failure.raw)},
+            {"has_pll_lock_loss", failure.has_pll_lock_loss},
+            {"has_temperature_failure", failure.has_temperature_failure},
+            {"has_adc_power_down", failure.has_adc_power_down}};
+}
+
+// Board state at one moment: status, failure register and ADC temperatures.
+struct BoardHealth {
+    AcquisitionStatus status;
+    BoardFailureStatus failure;
+    std::vector<int> adc_temperatures_celsius;
+};
+
+json board_health_json(const BoardHealth& health) {
+    return {{"acquisition_status_0x8104", acquisition_status_json(health.status)},
+            {"board_failure_status_0x8178", board_failure_json(health.failure)},
+            {"adc_temperatures_celsius", health.adc_temperatures_celsius}};
+}
+
+std::string temperature_range_text(const std::vector<int>& temperatures) {
+    if (temperatures.empty()) {
+        return "unread";
+    }
+    const auto [low, high] = std::minmax_element(temperatures.begin(), temperatures.end());
+    return std::to_string(*low) + ".." + std::to_string(*high) + " °C";
+}
+
+json chunks_json(const ChunkTracker& tracker) {
+    json out = json::array();
+    for (const ChunkInfo& c : tracker.chunks()) {
+        json cj = {{"index", c.index},
+                   {"file", c.file},
+                   {"n_events", c.n_events},
+                   {"first_event_counter", c.first_event_counter},
+                   {"last_event_counter", c.last_event_counter},
+                   {"start_unix_time_ns", c.start_ns},
+                   {"end_unix_time_ns", nullptr},
+                   {"first_waveform_start_unix_time_ns", c.first_waveform_start_ns},
+                   {"last_waveform_end_unix_time_ns", c.last_waveform_end_ns}};
+        if (c.end_ns) {
+            cj["end_unix_time_ns"] = *c.end_ns;
+        }
+        out.push_back(cj);
+    }
+    return out;
+}
 
 class ReadoutBuffer {
 public:
@@ -299,6 +396,9 @@ public:
     Session& operator=(const Session&) = delete;
 
     void print_info(FILE* out) const {
+        std::fprintf(out, "board_name: %s\n", cfg_.board_name.c_str());
+        std::fprintf(out, "expected_serial: %u\n", cfg_.expected_serial);
+        std::fprintf(out, "expected_clock_source: %s\n", to_string(cfg_.clock_source));
         std::fprintf(out, "model: %s\n", board_.model_name.c_str());
         std::fprintf(out, "model_code: %u\n", board_.model);
         std::fprintf(out, "serial: %u\n", board_.serial);
@@ -321,6 +421,71 @@ public:
                      cfg_.connection.use_vme_base_address ? "true" : "false");
         std::fprintf(out, "open_base: %s\n", hex32(open_base_address(cfg_.connection)).c_str());
         std::fflush(out);
+    }
+
+    // Stops before any write when the opened board is not the configured one.
+    void verify_identity() const {
+        const BoardIdentity identity{cfg_.board_name, board_.serial, board_.roc_fw, board_.amc_fw};
+        const std::optional<std::string> problem =
+            identity_problem(identity, cfg_.expected_serial, cfg_.protected_serials);
+        if (problem) {
+            throw std::runtime_error(*problem);
+        }
+    }
+
+    // Read-only status report for the info command.
+    void print_health(FILE* out) {
+        const BoardHealth health = read_health();
+        std::fprintf(out, "status_0x8104: %s\n", hex32(health.status.raw).c_str());
+        std::fprintf(out, "clock_source: %s\n",
+                     health.status.is_clock_external ? "external" : "internal");
+        std::fprintf(out, "pll_lock_kept: %s\n", health.status.is_pll_lock_kept ? "yes" : "no");
+        std::fprintf(out, "board_ready: %s\n", health.status.is_board_ready ? "yes" : "no");
+        std::fprintf(out, "channels_shut_down: %s\n",
+                     health.status.are_channels_shut_down ? "yes" : "no");
+        std::fprintf(out, "board_failure_0x8178: %s\n", hex32(health.failure.raw).c_str());
+        std::fprintf(out, "pll_lock_loss: %s\n", health.failure.has_pll_lock_loss ? "yes" : "no");
+        std::fprintf(out, "temperature_failure: %s\n",
+                     health.failure.has_temperature_failure ? "yes" : "no");
+        std::fprintf(out, "adc_power_down: %s\n",
+                     health.failure.has_adc_power_down ? "yes" : "no");
+        std::fprintf(out, "adc_temperatures_celsius:");
+        for (const int temperature : health.adc_temperatures_celsius) {
+            std::fprintf(out, " %d", temperature);
+        }
+        std::fprintf(out, "\n");
+        for (const std::string& problem :
+             health_problems(health.status, health.failure, {cfg_.clock_source, false, false})) {
+            std::fprintf(out, "status_problem: %s\n", problem.c_str());
+        }
+        std::fflush(out);
+    }
+
+    // Before the first write: a wrong clock or channels in shutdown cannot be fixed by
+    // programming the board.
+    void check_status_before_writing() {
+        require_status(read_fresh_status(), read_failure(), {cfg_.clock_source, false, false},
+                       "before programming");
+    }
+
+    // After programming and baseline, just before the acquisition starts. Also
+    // records the board health for the metadata.
+    void check_status_before_start() {
+        health_start_ = read_health();
+        health_start_->status = read_fresh_status();
+        require_status(health_start_->status, health_start_->failure,
+                       {cfg_.clock_source, true, false}, "before start");
+        std::fprintf(stderr,
+                     "status: %s 0x8104=%s clock %s, ready; 0x8178=%s; ADC temperatures %s\n",
+                     cfg_.board_name.c_str(), hex32(health_start_->status.raw).c_str(),
+                     to_string(cfg_.clock_source), hex32(health_start_->failure.raw).c_str(),
+                     temperature_range_text(health_start_->adc_temperatures_celsius).c_str());
+        std::fflush(stderr);
+    }
+
+    // Bench access for the reg command: no reset, no programming.
+    RegisterAccess register_command(uint32_t address, std::optional<uint32_t> value) {
+        return access_masked(address, value);
     }
 
     void check_target() const {
@@ -631,20 +796,11 @@ public:
                   "external trigger off");
             check(CAEN_DGTZ_SetSWTriggerMode(handle_, CAEN_DGTZ_TRGMODE_DISABLED), "SW trigger off");
             const CoincidenceProgram& coin = *cfg_.coincidence;
-            for (ChannelResult& result : results_) {
-                if (!result.enabled) {
-                    continue;
-                }
-                const double baseline = result.measured ? result.mean
-                                                        : target_baseline_adc(result.target_percent);
-                result.threshold_adc = threshold_adc(result.polarity == Polarity::Positive, baseline,
-                                                     result.threshold_counts);
-                check(CAEN_DGTZ_SetChannelTriggerThreshold(
-                          handle_, static_cast<uint32_t>(result.index),
-                          static_cast<uint32_t>(result.threshold_adc)),
-                      "SetChannelTriggerThreshold");
-            }
-            check(CAEN_DGTZ_SetChannelSelfTrigger(handle_, CAEN_DGTZ_TRGMODE_ACQ_ONLY,
+            program_thresholds(cfg_.channel_mask);
+            check(CAEN_DGTZ_SetChannelSelfTrigger(handle_,
+                                                  cfg_.trigger_requests.trg_out
+                                                      ? CAEN_DGTZ_TRGMODE_ACQ_AND_EXTOUT
+                                                      : CAEN_DGTZ_TRGMODE_ACQ_ONLY,
                                                   coin.participant_mask),
                   "enable pair self trigger");
             pair_readback_.clear();
@@ -666,6 +822,10 @@ public:
             std::fprintf(stderr, "coincidence: 0x810C written=%s majority=%d window_ns=%d\n",
                          hex32(coin.register_810c).c_str(), coin.majority, coin.window_ns);
         }
+        apply_trigger_requests();
+        apply_analog_monitor();
+        apply_overlap_acceptance();
+        apply_register_writes();
         uint32_t rb = 0;
         check(CAEN_DGTZ_ReadRegister(handle_, 0x810C, &rb), "read 0x810C");
         reg_810c_read_ = rb;
@@ -679,9 +839,14 @@ public:
         const fs::path run_dir = make_run_dir();
         fs::copy_file(config_path, run_dir / "config.json", fs::copy_options::overwrite_existing);
         WaveformWriter writer(run_dir, cfg_.waveforms_per_file);
-        const std::string started = utc_now_iso();
+        const UtcStamp started = utc_now_stamp();
         std::string stop = "error";
         json meta = make_metadata(started);
+        meta["stop_conditions"] = {
+            {"duration_s", cfg_.duration_s > 0.0 ? json(cfg_.duration_s) : json(nullptr)},
+            {"duration_s_source",
+             cfg_.duration_s_from_command_line ? "command line --duration" : "config duration_s"},
+            {"max_events", max_events > 0 ? json(max_events) : json(nullptr)}};
         write_metadata(run_dir / "metadata.json", meta);
 
         std::fprintf(stdout, "directory=%s\n", run_dir.string().c_str());
@@ -691,9 +856,21 @@ public:
         ensure_readout();
         check(CAEN_DGTZ_ClearData(handle_), "ClearData");
         const timespec start = mono_now();
-        timespec last_status = start;
+        double next_status_check_s = kStatusCheckPeriodS;
         int last_file = 0;
         start_sw("run");
+        // The trigger time tag counts from this start. acq_start_ns_ is taken
+        // just before SWStartAcquisition, after started.
+        TimeTagUnwrapper unwrapper(acq_start_ns_);
+        ChunkTracker chunks(started.unix_ns, acq_start_ns_, post_actual_);
+        SampleCountSummary sample_counts(record_read_);
+        meta["acquisition_start_unix_time_ns"] = acq_start_ns_;
+        const auto update_files = [&] {
+            meta["events_written"] = writer.events_written();
+            meta["files"] = writer.filenames();
+            meta["chunks"] = chunks_json(chunks);
+            meta["sample_counts"] = sample_counts_json(sample_counts);
+        };
 
         timespec next_trigger = start;
         const bool rate = cfg_.trigger == TriggerType::Rate;
@@ -720,13 +897,20 @@ public:
                     if (max_events > 0 && writer.events_written() >= max_events) {
                         return false;
                     }
+                    // PC time after ReadData returned: the event happened before it.
+                    const int64_t read_ns = unix_now_ns();
                     WaveformEvent event;
                     event.event_counter = info.EventCounter;
                     event.trigger_time_tag = info.TriggerTimeTag;
+                    event.trigger_time_ticks = unwrapper.unwrap(info.TriggerTimeTag, read_ns);
                     event.channel_mask = cfg_.channel_mask;
-                    event.sample_count = record_read_;
-                    event.samples = extract_enabled(ev, record_read_);
+                    event.sample_count = common_sample_count(ev->ChSize, cfg_.channel_mask);
+                    event.samples = extract_enabled(ev, event.sample_count);
                     writer.write_event(event);
+                    chunks.add_event(writer.file_index(), writer.filenames().back(),
+                                     event.event_counter, event.trigger_time_ticks,
+                                     event.sample_count);
+                    sample_counts.add(event.sample_count);
                     return !(max_events > 0 && writer.events_written() >= max_events);
                 });
                 if (max_events > 0 && writer.events_written() >= max_events) {
@@ -734,17 +918,26 @@ public:
                     break;
                 }
                 const bool file_changed = writer.file_index() != last_file;
-                if (file_changed || elapsed_s(mono_now(), last_status) >= 1.0) {
+                const double run_time_s = elapsed_s(mono_now(), start);
+                const bool is_status_due = run_time_s >= next_status_check_s;
+                if (is_status_due) {
+                    next_status_check_s = next_status_check_time(next_status_check_s, run_time_s,
+                                                                 kStatusCheckPeriodS);
+                    status_problems_ = check_status_during_run();
+                    if (!status_problems_.empty()) {
+                        stop = "board_status";
+                        break;
+                    }
+                }
+                if (file_changed || is_status_due) {
                     writer.flush();
-                    meta["events_written"] = writer.events_written();
-                    meta["files"] = writer.filenames();
+                    update_files();
                     write_metadata(run_dir / "metadata.json", meta);
                     std::fprintf(stdout, "events=%llu file=%d\n",
                                  static_cast<unsigned long long>(writer.events_written()),
                                  writer.file_index());
                     std::fflush(stdout);
                     last_file = writer.file_index();
-                    last_status = mono_now();
                 }
                 if (n == 0) {
                     timespec wake = mono_now();
@@ -760,9 +953,13 @@ public:
             }
         } catch (...) {
             writer.flush();
-            meta["events_written"] = writer.events_written();
-            meta["files"] = writer.filenames();
-            meta["ended_utc"] = utc_now_iso();
+            // The last chunk ends no earlier than its last waveform, and the run
+            // ends no earlier than the last chunk.
+            const int64_t chunk_end = chunks.close(unix_now_ns());
+            update_files();
+            const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
+            meta["ended_utc"] = ended.iso;
+            meta["ended_utc_unix_time_ns"] = ended.unix_ns;
             meta["stop_reason"] = "error";
             write_metadata(run_dir / "metadata.json", meta);
             throw;
@@ -773,15 +970,23 @@ public:
             acq_on_ = false;
         }
         writer.flush();
-        meta["events_written"] = writer.events_written();
-        meta["files"] = writer.filenames();
-        meta["ended_utc"] = utc_now_iso();
+        const int64_t chunk_end = chunks.close(unix_now_ns());
+        update_files();
+        const UtcStamp ended = utc_stamp_from_ns(std::max(unix_now_ns(), chunk_end));
+        meta["ended_utc"] = ended.iso;
+        meta["ended_utc_unix_time_ns"] = ended.unix_ns;
         meta["stop_reason"] = stop;
+        meta["board_health"]["end"] = read_health_json_or_null();
+        meta["board_health"]["status_checks_during_run"] = status_checks_during_run_;
+        meta["board_health"]["problems"] = status_problems_;
         write_metadata(run_dir / "metadata.json", meta);
         std::fprintf(stdout, "events=%llu file=%d stop=%s\n",
                      static_cast<unsigned long long>(writer.events_written()), writer.file_index(),
                      stop.c_str());
         std::fflush(stdout);
+        if (!status_problems_.empty()) {
+            throw std::runtime_error(status_problem_message("during the run"));
+        }
         if (writer.events_written() > 0) {
             prove_coincidence_after_stop();
         }
@@ -812,10 +1017,22 @@ public:
         const bool rate = cfg_.trigger == TriggerType::Rate;
         const int64_t period_ns = rate ? std::llround(1e9 / cfg_.rate_hz) : 0;
 
+        double next_status_check_s = kStatusCheckPeriodS;
         while (!g_stop_signal) {
             const timespec now = mono_now();
             if (cfg_.duration_s > 0.0 && elapsed_s(now, start) >= cfg_.duration_s) {
                 break;
+            }
+            const double scope_time_s = elapsed_s(now, start);
+            if (scope_time_s >= next_status_check_s) {
+                next_status_check_s = next_status_check_time(next_status_check_s, scope_time_s,
+                                                             kStatusCheckPeriodS);
+                status_problems_ = check_status_during_run();
+                if (!status_problems_.empty()) {
+                    CAEN_DGTZ_SWStopAcquisition(handle_);
+                    acq_on_ = false;
+                    throw std::runtime_error(status_problem_message("during scope"));
+                }
             }
             if (rate && ts_ge(now, next_trigger)) {
                 check(CAEN_DGTZ_SendSWtrigger(handle_), "SendSWtrigger");
@@ -865,6 +1082,72 @@ public:
     }
 
 private:
+    AcquisitionStatus read_status() {
+        uint32_t raw = 0;
+        check(CAEN_DGTZ_ReadRegister(handle_, 0x8104, &raw), "read status 0x8104");
+        return decode_acquisition_status(raw);
+    }
+
+    // Reading 0x8104 clears its PLL-unlock flag (bit 7), so the first read can show an
+    // unlock from before (e.g. power on); the second read shows the current state.
+    AcquisitionStatus read_fresh_status() {
+        read_status();
+        return read_status();
+    }
+
+    BoardFailureStatus read_failure() {
+        uint32_t raw = 0;
+        check(CAEN_DGTZ_ReadRegister(handle_, 0x8178, &raw), "read board failure 0x8178");
+        return decode_board_failure_status(raw);
+    }
+
+    BoardHealth read_health() {
+        BoardHealth health;
+        health.status = read_status();
+        health.failure = read_failure();
+        for (uint32_t ch = 0; ch < board_.channels; ++ch) {
+            uint32_t raw = 0;
+            check(CAEN_DGTZ_ReadRegister(handle_, 0x10A8u | (ch << 8), &raw),
+                  "read ADC temperature 0x1nA8");
+            health.adc_temperatures_celsius.push_back(decode_adc_temperature(raw));
+        }
+        return health;
+    }
+
+    json read_health_json_or_null() {
+        try {
+            return board_health_json(read_health());
+        } catch (const std::exception& err) {
+            std::fprintf(stderr, "board health at the end not read: %s\n", err.what());
+            return nullptr;
+        }
+    }
+
+    std::vector<std::string> check_status_during_run() {
+        ++status_checks_during_run_;
+        const AcquisitionStatus status = read_status();
+        return health_problems(status, read_failure(),
+                               {cfg_.clock_source, false, is_running_bit_reliable_});
+    }
+
+    std::string status_problem_message(const std::string& when) const {
+        std::string message = cfg_.board_name + " " + when + ":";
+        for (const std::string& problem : status_problems_) {
+            message += "\n  " + problem;
+        }
+        return message;
+    }
+
+    void require_status(const AcquisitionStatus& status, const BoardFailureStatus& failure,
+                        const StatusExpectation& expectation, const std::string& when) {
+        status_problems_ = health_problems(status, failure, expectation);
+        if (!status_problems_.empty()) {
+            throw std::runtime_error(status_problem_message(when + " (0x8104=" +
+                                                            hex32(status.raw) + ", 0x8178=" +
+                                                            hex32(failure.raw) + ")"));
+        }
+    }
+
     uint32_t wait_status_after_reset(CAEN_DGTZ_ErrorCode reset_err, uint32_t status_before) {
         const timespec start = mono_now();
         uint32_t status = 0;
@@ -902,7 +1185,11 @@ private:
                                      ": acquisition control 0x8100 is not SW_CONTROLLED (" +
                                      hex32(control) + ")");
         }
+        // The board resets the trigger time tag when acquisition starts. This
+        // PC time is taken before, so it is a lower bound for that reset.
+        acq_start_ns_ = unix_now_ns();
         const CAEN_DGTZ_ErrorCode err = CAEN_DGTZ_SWStartAcquisition(handle_);
+        is_running_bit_reliable_ = err == CAEN_DGTZ_Success;
         if (err != CAEN_DGTZ_Success) {
             uint32_t status = 0;
             uint32_t control_after = 0;
@@ -1142,6 +1429,140 @@ private:
         }
     }
 
+    // Read, optionally write (value & mask merged into the old value), read back.
+    RegisterAccess access_masked(uint32_t address, std::optional<uint32_t> value,
+                                 uint32_t mask = 0xffffffffu) {
+        RegisterAccess a;
+        a.address = address;
+        a.mask = mask;
+        check(CAEN_DGTZ_ReadRegister(handle_, address, &a.before), "register read");
+        a.after = a.before;
+        if (value) {
+            a.wrote = true;
+            a.written = (a.before & ~mask) | (*value & mask);
+            check(CAEN_DGTZ_WriteRegister(handle_, address, a.written), "register write");
+            check(CAEN_DGTZ_ReadRegister(handle_, address, &a.after), "register readback");
+        }
+        return a;
+    }
+
+    // Thresholds relative to the measured baseline (or the target when the
+    // baseline step was skipped), for the channels in mask.
+    void program_thresholds(uint32_t mask) {
+        for (ChannelResult& result : results_) {
+            if (!result.enabled || (mask & (1u << result.index)) == 0u) {
+                continue;
+            }
+            const double baseline =
+                result.measured ? result.mean : target_baseline_adc(result.target_percent);
+            result.threshold_adc = threshold_adc(result.polarity == Polarity::Positive, baseline,
+                                                 result.threshold_counts);
+            check(CAEN_DGTZ_SetChannelTriggerThreshold(handle_, static_cast<uint32_t>(result.index),
+                                                       static_cast<uint32_t>(result.threshold_adc)),
+                  "SetChannelTriggerThreshold");
+        }
+    }
+
+    // trigger_requests: thresholds and the self-trigger pulse width (0x1n70)
+    // without letting the requests start the acquisition, unless the trigger
+    // type is coincidence. MON/Σ in majority mode counts these requests.
+    void apply_trigger_requests() {
+        const TriggerRequestConfig& tr = cfg_.trigger_requests;
+        width_access_.clear();
+        shape_access_.clear();
+        if (!tr.configured) {
+            return;
+        }
+        uint32_t mask = tr.channel_mask;
+        if (cfg_.trigger == TriggerType::Coincidence) {
+            // Thresholds and enables were set with the pairs; widen them too.
+            mask |= cfg_.coincidence->participant_mask;
+        } else {
+            program_thresholds(mask);
+            if (tr.trg_out) {
+                check(CAEN_DGTZ_SetChannelSelfTrigger(handle_, CAEN_DGTZ_TRGMODE_EXTOUT_ONLY, mask),
+                      "self trigger to TRG-OUT");
+            }
+        }
+        for (int ch = 0; ch < 16; ++ch) {
+            if ((mask & (1u << ch)) == 0u) {
+                continue;
+            }
+            const uint32_t width_addr = 0x1070u | (static_cast<uint32_t>(ch) << 8);
+            std::optional<uint32_t> width;
+            if (tr.width_steps > 0u) {
+                width = tr.width_steps;
+            }
+            const RegisterAccess w = access_masked(width_addr, width);
+            width_access_.push_back(w);
+            std::fprintf(stderr, "trigger_requests: ch%d 0x1n70 addr=%s before=%s", ch,
+                         hex32(width_addr).c_str(), hex32(w.before).c_str());
+            if (w.wrote) {
+                std::fprintf(stderr, " written=%s readback=%s%s", hex32(w.written).c_str(),
+                             hex32(w.after).c_str(),
+                             w.matches() ? "" : "  WARNING: board did not keep the width");
+            }
+            std::fprintf(stderr, "\n");
+            if ((ch % 2) == 0 || (mask & (1u << (ch - 1))) == 0u) {
+                // 0x1n84 is the pair register (n = even channel): logic in
+                // bits[1:0]; bit[2] = 0 pulse of 0x1n70 width (default),
+                // 1 = over/under-threshold level (UM5118 Sec. 1.9). Only logged.
+                const uint32_t pair_addr = 0x1084u | (static_cast<uint32_t>(ch & ~1) << 8);
+                const RegisterAccess s = access_masked(pair_addr, std::nullopt);
+                shape_access_.push_back(s);
+                std::fprintf(stderr, "trigger_requests: pair %d-%d 0x1n84 addr=%s value=%s\n",
+                             ch & ~1, (ch & ~1) + 1, hex32(pair_addr).c_str(),
+                             hex32(s.before).c_str());
+            }
+        }
+        std::fprintf(stderr, "trigger_requests: width_ns=%u (%u steps of 8 ns) trg_out=%s\n",
+                     tr.width_ns, tr.width_steps, tr.trg_out ? "true" : "false");
+        std::fflush(stderr);
+    }
+
+    void apply_analog_monitor() {
+        monitor_access_.clear();
+        const AnalogMonitorConfig& am = cfg_.analog_monitor;
+        if (!am.configured) {
+            return;
+        }
+        if (am.mode == MonitorMode::VoltageLevel) {
+            // Vmon = N / 4096 V, 12-bit N at 0x8138.
+            monitor_access_.push_back(access_masked(0x8138u, am.level_code, 0xfffu));
+        }
+        monitor_access_.push_back(access_masked(0x8144u, monitor_mode_bits(am.mode), 0x7u));
+        for (const RegisterAccess& a : monitor_access_) {
+            std::fprintf(stderr, "analog_monitor: %s before=%s written=%s readback=%s%s\n",
+                         hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                         hex32(a.after).c_str(), a.matches() ? "" : "  WARNING: readback differs");
+        }
+        std::fprintf(stderr, "analog_monitor: mode=%s\n", to_string(am.mode));
+        std::fflush(stderr);
+    }
+
+    void apply_overlap_acceptance() {
+        constexpr uint32_t kOverlapBit = 0x2u;
+        overlap_access_ = access_masked(
+            0x8000u, cfg_.accept_overlapping_triggers ? kOverlapBit : 0u, kOverlapBit);
+        std::fprintf(stderr, "accept_overlapping_triggers: %s, 0x8000 readback=%s%s\n",
+                     cfg_.accept_overlapping_triggers ? "true" : "false",
+                     hex32(overlap_access_.after).c_str(),
+                     overlap_access_.matches() ? "" : "  WARNING: readback differs");
+        std::fflush(stderr);
+    }
+
+    void apply_register_writes() {
+        raw_access_.clear();
+        for (const RegisterWrite& w : cfg_.register_writes) {
+            const RegisterAccess a = access_masked(w.address, w.value, w.mask);
+            raw_access_.push_back(a);
+            std::fprintf(stderr, "register_writes: %s before=%s written=%s readback=%s%s\n",
+                         hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                         hex32(a.after).c_str(), a.matches() ? "" : "  WARNING: readback differs");
+        }
+        std::fflush(stderr);
+    }
+
     void ensure_readout() {
         if (!readout_) {
             readout_ = std::make_unique<ReadoutBuffer>(handle_);
@@ -1304,7 +1725,7 @@ private:
         return dir;
     }
 
-    json make_metadata(const std::string& started) const {
+    json make_metadata(const UtcStamp& started) const {
         json meta;
         meta["board"] = {
             {"model", board_.model_name},
@@ -1321,6 +1742,9 @@ private:
         if (board_.has_board_info_reg) {
             meta["board"]["board_info_0x8140"] = hex32(board_.board_info_reg);
         }
+        meta["board"]["name"] = cfg_.board_name;
+        meta["board"]["expected_serial"] = cfg_.expected_serial;
+        meta["board"]["expected_clock_source"] = to_string(cfg_.clock_source);
         meta["link"] = {
             {"link_type", cfg_.connection.link_type},
             {"link_num", cfg_.connection.link_num},
@@ -1346,12 +1770,17 @@ private:
         meta["pre_trigger_samples_actual"] = pre_actual_;
         meta["post_trigger_samples_actual"] = post_actual_;
         meta["trigger_time_tag_tick_ns"] = kTriggerTimeTagTickNs;
+        meta["trigger_time_tag_wrap_ticks"] = kTriggerTimeTagWrapTicks;
+        meta["waveform_format"] = std::string(kWaveMagic, 4);
+        meta["trigger_time_ticks_note"] =
+            "trigger_time_ticks in each event header is the unwrapped trigger time tag in 8 ns ticks "
+            "since acquisition start. Unix ns = acquisition_start_unix_time_ns + ticks * 8 "
+            "(PC-clock accuracy, about a millisecond).";
         meta["sample_period_ns"] = kSamplePeriodNs;
         meta["event_counter_note"] =
             "event_counter is the digitizer header counter. Baseline software triggers can advance it before the run.";
         meta["channel_mask"] = hex32(cfg_.channel_mask);
         meta["enabled_channels"] = channels_from_mask(cfg_.channel_mask);
-        meta["dynamic_range"] = to_string(cfg_.dynamic_range);
 
         json trig = {{"type", to_string(cfg_.trigger)}, {"io_level", to_string(cfg_.io_level)}};
         if (cfg_.trigger == TriggerType::Rate) {
@@ -1387,6 +1816,54 @@ private:
         }
         meta["trigger"] = trig;
 
+        const TriggerRequestConfig& tr = cfg_.trigger_requests;
+        if (tr.configured) {
+            json widths = json::array();
+            for (const RegisterAccess& a : width_access_) {
+                widths.push_back(register_access_json(a));
+            }
+            json shapes = json::array();
+            for (const RegisterAccess& a : shape_access_) {
+                shapes.push_back(register_access_json(a));
+            }
+            meta["trigger_requests"] = {
+                {"width_ns", tr.width_ns},
+                {"width_steps", tr.width_steps},
+                {"channels", channels_from_mask(tr.channel_mask)},
+                {"trg_out", tr.trg_out},
+                {"width_registers_0x1n70", widths},
+                {"pair_registers_0x1n84", shapes},
+                {"note",
+                 "Thresholds and self-trigger pulse width are programmed. With an external or "
+                 "rate trigger the requests do not start the acquisition; MON/Σ in majority "
+                 "mode and (with trg_out) TRG-OUT see them."},
+            };
+        } else {
+            meta["trigger_requests"] = nullptr;
+        }
+        if (cfg_.analog_monitor.configured) {
+            json regs = json::array();
+            for (const RegisterAccess& a : monitor_access_) {
+                regs.push_back(register_access_json(a));
+            }
+            json am = {{"mode", to_string(cfg_.analog_monitor.mode)}, {"registers", regs}};
+            if (cfg_.analog_monitor.mode == MonitorMode::VoltageLevel) {
+                am["level_volts"] = cfg_.analog_monitor.level_volts;
+                am["level_code"] = cfg_.analog_monitor.level_code;
+            }
+            meta["analog_monitor"] = am;
+        } else {
+            meta["analog_monitor"] = nullptr;
+        }
+        json raw = json::array();
+        for (const RegisterAccess& a : raw_access_) {
+            raw.push_back(register_access_json(a));
+        }
+        meta["register_writes"] = raw;
+        meta["accept_overlapping_triggers"] = {
+            {"set", cfg_.accept_overlapping_triggers},
+            {"register_0x8000", register_access_json(overlap_access_)}};
+
         json channels = json::array();
         for (const ChannelResult& result : results_) {
             json cj = {{"index", result.index},
@@ -1413,12 +1890,23 @@ private:
             channels.push_back(cj);
         }
         meta["channels"] = channels;
-        meta["started_utc"] = started;
+        meta["started_utc"] = started.iso;
+        meta["started_utc_unix_time_ns"] = started.unix_ns;
         meta["ended_utc"] = nullptr;
+        meta["ended_utc_unix_time_ns"] = nullptr;
+        meta["acquisition_start_unix_time_ns"] = nullptr;
         meta["events_written"] = 0;
         meta["files"] = json::array();
+        meta["chunks"] = json::array();
         meta["stop_reason"] = nullptr;
         meta["waveforms_per_file"] = cfg_.waveforms_per_file;
+        meta["board_health"] = {
+            {"start", health_start_ ? board_health_json(*health_start_) : json(nullptr)},
+            {"end", nullptr},
+            {"status_checks_during_run", 0},
+            {"problems", json::array()},
+            {"note", "start: just before the acquisition starts; end: after it stopped. "
+                     "0x8104 and 0x8178 are checked once per second during the run."}};
         return meta;
     }
 
@@ -1454,6 +1942,7 @@ private:
     const Config& cfg_;
     int handle_ = -1;
     bool acq_on_ = false;
+    int64_t acq_start_ns_ = 0;
     BoardReport board_;
     uint32_t record_read_ = 0;
     uint32_t post_percent_read_ = 0;
@@ -1463,6 +1952,15 @@ private:
     uint32_t reg_810c_read_ = 0;
     std::vector<ChannelResult> results_;
     std::vector<PairReadback> pair_readback_;
+    std::vector<RegisterAccess> width_access_;
+    std::vector<RegisterAccess> shape_access_;
+    std::vector<RegisterAccess> monitor_access_;
+    std::vector<RegisterAccess> raw_access_;
+    RegisterAccess overlap_access_;
+    std::optional<BoardHealth> health_start_;
+    std::vector<std::string> status_problems_;
+    uint64_t status_checks_during_run_ = 0;
+    bool is_running_bit_reliable_ = true;
     std::unique_ptr<ReadoutBuffer> readout_;
 };
 
@@ -1471,18 +1969,39 @@ private:
 void command_info(const Config& cfg) {
     Session session(cfg);
     session.print_info(stdout);
+    session.verify_identity();
     session.check_target();
+    session.print_health(stdout);
 }
 
 void command_run(const Config& cfg, const std::string& config_path, uint64_t max_events) {
     install_stop_signals();
     Session session(cfg);
     session.print_info(stderr);
+    session.verify_identity();
     session.check_target();
+    session.check_status_before_writing();
     session.program();
     session.baseline_if_needed();
     session.arm_trigger();
+    session.check_status_before_start();
     session.acquire_run(config_path, max_events);
+}
+
+void command_reg(const Config& cfg, uint32_t address, std::optional<uint32_t> value) {
+    Session session(cfg);
+    session.verify_identity();
+    session.check_target();
+    const RegisterAccess a = session.register_command(address, value);
+    if (a.wrote) {
+        std::fprintf(stdout, "address=%s before=%s written=%s readback=%s%s\n",
+                     hex32(a.address).c_str(), hex32(a.before).c_str(), hex32(a.written).c_str(),
+                     hex32(a.after).c_str(), a.matches() ? "" : " (differs)");
+    } else {
+        std::fprintf(stdout, "address=%s value=%s\n", hex32(a.address).c_str(),
+                     hex32(a.before).c_str());
+    }
+    std::fflush(stdout);
 }
 
 void command_scope(const Config& cfg, int channel) {
@@ -1493,9 +2012,12 @@ void command_scope(const Config& cfg, int channel) {
     install_stop_signals();
     Session session(cfg);
     session.print_info(stderr);
+    session.verify_identity();
     session.check_target();
+    session.check_status_before_writing();
     session.program();
     session.baseline_if_needed();
     session.arm_trigger();
+    session.check_status_before_start();
     session.acquire_scope(channel);
 }
